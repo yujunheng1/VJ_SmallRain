@@ -1,4 +1,4 @@
-# VJ_-小雨
+# VJ_小雨
 
 一个基于 Three.js、WebGL Shader 和 Web Audio API 的 3D 音乐可视化/VJ 项目。
 
