@@ -1,0 +1,2507 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>小雨 · 黄龄 — 3D 苗岭引路 VJ</title>
+<link rel="stylesheet" href="./src/styles.css">
+</head>
+<body>
+<div id="overlay">
+  <div id="title">小 雨</div>
+  <div id="artist">黄 龄 · 3D 苗 岭 引 路</div>
+  <div id="poem">竹林雾雨里，银蝶是赤足起舞的苗家少女<br>银饰随雨声叮铃作响，浮萍在她足尖低语<br>舞尽人散，方知一梦 —— 烙下红印</div>
+  <div id="hint">点 击 开 始 &nbsp;·&nbsp; F = 全 屏</div>
+  <div id="err"></div>
+</div>
+<div id="hud">小雨 · 黄龄 · 3D &nbsp;|&nbsp; F 全屏 · SPACE 暂停</div>
+<audio id="song" preload="auto" src="./assets/小雨 - 黄龄.flac"></audio>
+
+<script type="module">
+import * as THREE from './vendor/three.module.js';
+import {createLyricParticleLine} from './src/lyricParticles.js';
+import {sectionAt, env, curve, DINGS, THUNDER, STORM, WINDC, NIGHTC, narrative, boltWindow} from './src/timeline.js';
+import {EYE_FULL, BFLY_PT, GLSL_SIM_NOISE, TORNADO_PT} from './src/shaderChunks.js?v=20260705-tornado';
+import {createWeatherMaterials} from './src/weatherMaterials.js';
+import {createFinalButterflyAssets} from './src/finalButterflyAssets.js';
+import {createGalaxyAssets} from './src/galaxyAssets.js';
+
+/* ---------- JS value noise (terrain) ---------- */
+const h2=(x,y)=>{const s=Math.sin(x*127.1+y*311.7)*43758.5453;return s-Math.floor(s);};
+function noise2(x,y){const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi,
+ u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
+ return h2(xi,yi)*(1-u)*(1-v)+h2(xi+1,yi)*u*(1-v)+h2(xi,yi+1)*(1-u)*v+h2(xi+1,yi+1)*u*v;}
+const riverX=z=>Math.sin(z*.017)*1.7+Math.sin(z*.0065+1.4)*1.0
+                +Math.sin(z*.041)*.45;    // 河道蜿蜒中心线：两长弯叠一点小摆
+function groundH(x,z){
+ const dx=x-riverX(z);                     // 相对河道中心的横距（河道随 z 蜿蜒）
+ const n=noise2(x*.15,z*.15)*1.4+noise2(x*.05,z*.05)*3.2;
+ const valley=Math.pow(Math.abs(x)/15,2)*7.0;
+ const river=-1.7*Math.exp(-(dx*dx)/6.5);
+ const h=n*.55+valley+river;
+ const carve=Math.exp(-(dx*dx)/14.6)*.85;  // 河槽压平：中心恒低于水面(-.35)，随河蜿蜒
+ return h*(1-carve)-1.15*carve;
+}
+const pathX=z=>riverX(z)+3.1+Math.sin(z*.03)*1.0+Math.sin(z*.011)*1.1;  // 步道贴着河岸走
+
+/* ============================================================
+   renderer / scene
+============================================================ */
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth,innerHeight);
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=1.05;
+document.body.appendChild(renderer.domElement);
+const scene=new THREE.Scene();
+scene.fog=new THREE.FogExp2(0x9fc4a8,0.016);
+const camera=new THREE.PerspectiveCamera(62,innerWidth/innerHeight,.1,900);
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;
+ camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);
+ if(post.rtS){const D2=Math.min(devicePixelRatio,2);
+  post.rtS.setSize(innerWidth*D2,innerHeight*D2);
+  post.rtA.setSize(innerWidth*D2>>1,innerHeight*D2>>1);
+  post.rtB.setSize(innerWidth*D2>>1,innerHeight*D2>>1);
+  post.rtC.setSize(innerWidth*D2>>2,innerHeight*D2>>2);
+  post.rtD.setSize(innerWidth*D2>>2,innerHeight*D2>>2);
+  post.rtH1.setSize(innerWidth*D2,innerHeight*D2);
+  post.rtH2.setSize(innerWidth*D2,innerHeight*D2);}});
+
+/* lights */
+const hemi=new THREE.HemisphereLight(0xcfe8d0,0x0a2015,0.9); scene.add(hemi);
+const sunDir=new THREE.Vector3(0.35,0.55,-0.75).normalize();     // 常规/夜晚月位
+const sunEve=new THREE.Vector3(0.40,0.30,-0.86).normalize();     // 苗寨段：低而不压地平的金色夕阳(~18°)
+const sunNow=new THREE.Vector3().copy(sunDir);                   // 每帧混合的实际日位
+const sun=new THREE.DirectionalLight(0xfff2cc,1.3); scene.add(sun); scene.add(sun.target);
+const flash=new THREE.DirectionalLight(0xd9c4ff,0);
+flash.position.set(0,1,0); scene.add(flash); scene.add(flash.target);
+
+/* shared GLSL noise */
+const GLSL_NOISE=`
+float hashg(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+float noiseg(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
+ float a=hashg(i),b=hashg(i+vec2(1,0)),c=hashg(i+vec2(0,1)),d=hashg(i+vec2(1,1));
+ return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);}
+float fbmg(vec2 p){float v=0.,a=.5;
+ for(int i=0;i<6;i++){v+=a*noiseg(p);p=mat2(.8,-.6,.6,.8)*p*2.03+vec2(11.3,7.1);a*=.52;}return v;}
+`;
+
+/* ============================================================
+   sky dome — living sun/moon, clouds, day↔night 活的天空
+============================================================ */
+const skyU={uT:{value:0},uNight:{value:0},uStorm:{value:0},uSec:{value:0},
+ uMid:{value:0},uBeat:{value:0},uBolt:{value:0},uDanger:{value:0},
+ uVil:{value:0},uVil2:{value:0},uPurple:{value:0},uClear:{value:0},uSea:{value:0},
+ uSunDir:{value:sunDir.clone()}};
+const sky=new THREE.Mesh(new THREE.SphereGeometry(700,48,24),new THREE.ShaderMaterial({
+ side:THREE.BackSide,depthWrite:false,fog:false,uniforms:skyU,
+ vertexShader:`varying vec3 vDir;void main(){vDir=position;
+  gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+ fragmentShader:GLSL_NOISE+`
+ varying vec3 vDir;
+ uniform float uT,uNight,uStorm,uSec,uMid,uBeat,uBolt,uDanger,uVil,uVil2,uPurple,uClear,uSea;
+ uniform vec3 uSunDir;
+ void main(){
+  vec3 dir=normalize(vDir);
+  float night=uNight, storm=uStorm;
+  vec3 deep=mix(vec3(.10,.24,.15),vec3(.012,.075,.048),night);
+  deep=mix(deep,vec3(.24,.36,.58),uVil);          // 苗寨段：明亮的蓝紫天顶(冷色锚点，与暖地平成对比)
+  deep=mix(deep,vec3(.05,.10,.20),uVil2);         // 第二段(雨谷)：旧村庄暮蓝靛青天顶
+  deep=mix(deep,vec3(.004,.02,.016),uDanger);
+  vec3 mist=mix(vec3(.72,.86,.74),vec3(.40,.60,.50),night);
+  mist=mix(mist,vec3(1.15,.72,.42),uVil);         // 夕阳橙金地平(提亮)
+  mist=mix(mist,vec3(.42,.47,.62),uVil2);         // 第二段：暮霭蓝紫地平
+  mist=mix(mist,vec3(.15,.23,.21),uDanger*.8);
+  vec3 silver=mix(vec3(1.,.95,.80),vec3(.78,.88,.90),night);
+  silver=mix(silver,vec3(1.15,.90,.60),uVil*.6);  // 夕阳暖金(提亮)
+  silver=mix(silver,vec3(1.,.86,.62),uVil2*.6);   // 第二段：暖色暮月
+  // gradient
+  float hz=max(dir.y,0.);
+  vec3 col=mix(mist*(.7+.3*uSec), deep*.9, pow(hz,.55));
+  col*=1.-.25*storm*hz;
+  // sun basis
+  vec3 su=normalize(cross(uSunDir,vec3(0.,1.,0.)));
+  vec3 sv=cross(su,uSunDir);
+  float px=dot(dir,su),py=dot(dir,sv),pz=dot(dir,uSunDir);
+  if(pz>0.){
+   vec2 p=vec2(px,py)*3.2;
+   float md=length(p);
+   float lang=atan(p.y,p.x);
+   float lightAmt=(.35+.75*uSec+.25*uMid+.5*(1.-night))*(1.-uDanger*.75)*(1.-storm*.3);
+   float limb=fbmg(vec2(lang*2.2,uT*.2)*2.);
+   float R=mix(.19,.15,night);
+   float Reff=R*(1.+(limb-.5)*mix(.12,.04,night));
+   float disc=smoothstep(Reff+.012,Reff-.012,md);
+   vec2 sq=p/R;
+   float gran=fbmg(sq*5.+vec2(uT*.07,-uT*.05));
+   float mare=fbmg(sq*3.2+17.)+.4*fbmg(sq*8.+31.);
+   vec3 sunS=mix(vec3(1.06,.99,.84),vec3(1.,.7,.42),smoothstep(.15,1.,md/R))*(.82+.32*gran);
+   vec3 moonS=silver*(.68+.38*smoothstep(.45,.95,mare))*(1.-.28*smoothstep(.7,1.,md/R));
+   col=mix(col,mix(sunS,moonS,night)*(1.+.5*uSec),disc*(1.-uDanger*.85)*(1.-storm*.3));
+   float cor=fbmg(vec2(lang*3.+sin(uT*.05)*2.,md*4.-uT*.38));
+   cor=pow(max(cor-.22,0.)*1.7,2.);
+   col+=mix(vec3(1.,.85,.52),silver,night)*cor*exp(-(md-Reff)*mix(3.,4.5,night))
+      *step(Reff*.9,md)*lightAmt*(.7+.6*uMid+.5*uBeat);
+   float fray=pow(.5+.5*sin(lang*8.+uT*.11),4.)+pow(.5+.5*sin(lang*3.-uT*.07+1.7),6.)*.7;
+   col+=silver*fray*exp(-md*mix(.9,1.2,night))*lightAmt*.30;
+   col+=silver*exp(-md*md*2.2)*lightAmt*.7;
+  }
+  // domain-warped clouds
+  vec2 cq=dir.xz/(dir.y+.28)*1.4+vec2(uT*.006,0.);
+  vec2 wq=vec2(fbmg(cq*1.4+vec2(0.,uT*.012)),fbmg(cq*1.4+vec2(5.2,1.3)));
+  float cl=fbmg(cq+wq*1.7);
+  float clm=smoothstep(.40-storm*.14,.80-storm*.18,cl)*smoothstep(.02,.25,dir.y);
+  vec3 cloudCol=mix(deep*(1.25-storm*.45),silver*.5,exp(-length(vec2(px,py))*2.)* (pz>0.?1.:0.) *.8);
+  col=mix(col,cloudCol,clm*(.5+.28*storm)*(1.-uClear*.92));   // 天光消散时云散去
+  // lightning flash — violet wash 紫色暴雨闪光
+  col+=vec3(.78,.60,1.08)*uBolt*.35;
+  // 忽而雷声隐隐 — the whole sky bruises violet 巨雷后天泛紫
+  col=mix(col,col*vec3(1.08,.80,1.45)+vec3(.13,.05,.28),uPurple*.65);
+  // 「吞入海底」— 整片天沉入深海的幽蓝
+  col=mix(col,vec3(.004,.030,.055),uSea*.6);
+  // 终章：天光消散，露出深空，让银河浮现
+  col=mix(col,vec3(.008,.011,.030),uClear*.80);
+  gl_FragColor=vec4(col,1.);
+ }`}));
+scene.add(sky);
+{ // 星野 stars — fade in with the night, hide in the storm; 星等幂律分布 终章天光消散后更深邃
+ const NS=24000,pos=new Float32Array(NS*3),rr=new Float32Array(NS);
+ for(let i=0;i<NS;i++){
+  const a=Math.random()*6.283,y=.04+Math.pow(Math.random(),.7)*.92;
+  const r=Math.sqrt(Math.max(1-y*y,0));
+  pos[i*3]=Math.cos(a)*r*640;pos[i*3+1]=y*640;pos[i*3+2]=Math.sin(a)*r*640;
+  rr[i]=Math.random();
+ }
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+ g.setAttribute('aR',new THREE.BufferAttribute(rr,1));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,fog:false,
+  blending:THREE.AdditiveBlending,
+  uniforms:{uT:skyU.uT,uNight:skyU.uNight,uStorm:skyU.uStorm,uClear:skyU.uClear,
+   uPR:{value:devicePixelRatio}},
+  vertexShader:`
+  attribute float aR;
+  uniform float uPR;
+  varying float vR;
+  void main(){
+   gl_PointSize=(.8+pow(aR,6.)*3.8)*uPR;               // 幂律: 多数极暗 少数亮星
+   vR=aR;
+   gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);
+  }`,
+  fragmentShader:`
+  uniform float uT,uNight,uStorm,uClear;
+  varying float vR;
+  void main(){
+   vec2 q=gl_PointCoord-.5;
+   float m=smoothstep(.5,.1,length(q));
+   float tw=.55+.45*sin(uT*(1.+vR*3.)+vR*40.);
+   float mag=.06+.94*pow(vR,5.);                       // 星等分布: 暗星如尘
+   float a=uNight*(1.-uStorm*.65)*tw*mag*(1.+uClear*1.2); // 天光消散→夜空更深星更显
+   vec3 tint=mix(vec3(.72,.8,1.),vec3(1.,.9,.72),step(.8,fract(vR*7.))); // 冷暖星色
+   gl_FragColor=vec4(tint*m*a,1.);
+  }`});
+ const st=new THREE.Points(g,m);
+ st.frustumCulled=false;sky.add(st);
+}
+{ // 银河带 Milky Way band — 横贯天幕的暗淡星带 与夜同现 风暴中隐 终章更明
+ const NB=160000,pos=new Float32Array(NB*3),cA=new Float32Array(NB*3),rr=new Float32Array(NB);
+ const eu=new THREE.Euler(-.95,0,.35),v=new THREE.Vector3();
+ const gs=()=>(Math.random()+Math.random()+Math.random()-1.5)/1.5;
+ for(let i=0;i<NB;i++){
+  let t,off;
+  do{t=Math.random()*6.283;off=gs()*.16;               // 沿大圆 + 高斯离面散布
+   v.set(Math.cos(t),off,Math.sin(t)).normalize().applyEuler(eu);
+  }while(v.y<.03);                                     // 只留地平线上
+  pos[i*3]=v.x*636;pos[i*3+1]=v.y*636;pos[i*3+2]=v.z*636;
+  const den=Math.pow(Math.abs(Math.sin(t*1.35+.7))*.5+Math.abs(Math.sin(t*3.1))*.5,1.5); // 疏密成絮
+  const wb=Math.exp(-(t-4.2)*(t-4.2)*2);               // 近"银心"段 更暖更密
+  let br=(.018+.05*Math.random())*(.3+.7*den)*(1+wb*1.4);
+  let sz=.7+Math.random()*1.3;
+  if(Math.random()<.03){br*=4;sz*=1.6;}                // 带中偶有亮星
+  const warm=Math.min(wb+Math.random()*.2,1);
+  cA[i*3]=(.78+.22*warm)*br;cA[i*3+1]=(.85+.0*warm)*br;cA[i*3+2]=(1.-.35*warm)*br;
+  rr[i]=sz;
+ }
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+ g.setAttribute('aC',new THREE.BufferAttribute(cA,3));
+ g.setAttribute('aR',new THREE.BufferAttribute(rr,1));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,fog:false,
+  blending:THREE.AdditiveBlending,
+  uniforms:{uT:skyU.uT,uNight:skyU.uNight,uStorm:skyU.uStorm,uClear:skyU.uClear,
+   uPR:{value:devicePixelRatio}},
+  vertexShader:`
+  attribute vec3 aC;
+  attribute float aR;
+  uniform float uPR;
+  varying vec3 vC;
+  void main(){
+   gl_PointSize=aR*uPR;
+   vC=aC;
+   gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);
+  }`,
+  fragmentShader:`
+  uniform float uT,uNight,uStorm,uClear;
+  varying vec3 vC;
+  void main(){
+   vec2 q=gl_PointCoord-.5;
+   float m=smoothstep(.5,.08,length(q));
+   float a=uNight*(1.-uStorm*.8)*(.5+.9*uClear);       // 平日隐约 终章天净时星带尽显
+   gl_FragColor=vec4(vC*m*a,1.);
+  }`});
+ const st=new THREE.Points(g,m);
+ st.frustumCulled=false;sky.add(st);
+}
+
+/* ============================================================
+   terrain 河谷地形
+============================================================ */
+let terrainU=null;
+{
+ const W=150,L=420,SW=90,SL=240;
+ const g=new THREE.PlaneGeometry(W,L,SW,SL);
+ g.rotateX(-Math.PI/2);
+ const pos=g.attributes.position,colors=[];
+ const c1=new THREE.Color(0x14301e),c2=new THREE.Color(0x2a4d2e),c3=new THREE.Color(0x0b1f14);
+ for(let i=0;i<pos.count;i++){
+  const x=pos.getX(i),z=pos.getZ(i)-170;
+  pos.setZ(i,z); // shift strip: z from +40 .. -380
+  const h=groundH(x,z);
+  pos.setY(i,h);
+  const n=noise2(x*.4,z*.4);
+  const col=c1.clone().lerp(c2,n).lerp(c3,Math.min(Math.abs(x)/40,1)*.6);
+  colors.push(col.r,col.g,col.b);
+ }
+ g.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));
+ g.computeVertexNormals();
+ const terrainMat=new THREE.MeshStandardMaterial({vertexColors:true,roughness:1});
+ terrainMat.onBeforeCompile=sh=>{                       // 苗寨段：暗绿地面染夕照暖光并抬亮
+  sh.uniforms.uVilG={value:0};terrainU=sh.uniforms;
+  sh.fragmentShader=('uniform float uVilG;\n'+sh.fragmentShader)
+   .replace('#include <color_fragment>',`#include <color_fragment>
+    diffuseColor.rgb=mix(diffuseColor.rgb,
+      diffuseColor.rgb*vec3(1.8,1.75,1.5)+vec3(.09,.10,.065),uVilG);`)  // 以抬亮为主·近中性偏土绿(暖色交给夕照光)
+   .replace('#include <emissivemap_fragment>',`#include <emissivemap_fragment>
+    totalEmissiveRadiance+=vec3(.05,.05,.032)*uVilG;`);                 // 极轻余温，避免死黑但不再平糊
+ };
+ scene.add(new THREE.Mesh(g,terrainMat));
+}
+
+/* ============================================================
+   river 溪流
+============================================================ */
+const waterU={uT:{value:0},uNight:{value:0},uSec:{value:0},uHigh:{value:0},
+ uBeat:{value:0},uFogC:{value:new THREE.Color()},uFogD:{value:.016},uVil:{value:0},uVil2:{value:0},
+ uMoon:{value:sunDir.clone()},uApp:{value:1},          // 河流显现度 — 巨雷后1s才现身
+ uRip:{value:Array.from({length:6},()=>new THREE.Vector4(0,0,-99,0))}};
+{
+ const g=new THREE.PlaneGeometry(10.5,420,1,180); g.rotateX(-Math.PI/2);  // 湖面外扩1/2·分段
+ {const wp=g.attributes.position;                       // 水面沿河道中心蜿蜒（网格位于 z=-170）
+  for(let i=0;i<wp.count;i++)wp.setX(i,wp.getX(i)+riverX(wp.getZ(i)-170));
+  wp.needsUpdate=true;}
+ const m=new THREE.ShaderMaterial({transparent:true,uniforms:waterU,
+  vertexShader:`varying vec3 vW;void main(){vW=(modelMatrix*vec4(position,1.)).xyz;
+   gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+  fragmentShader:GLSL_NOISE+`
+  varying vec3 vW;
+  uniform float uT,uNight,uSec,uHigh,uBeat,uFogD,uVil,uVil2,uApp;
+  uniform vec3 uFogC,uMoon;
+  uniform vec4 uRip[6];
+  void main(){
+   if(uApp<.004)discard;                               // 巨雷前无河
+   vec3 deep=mix(vec3(.06,.16,.11),vec3(.01,.05,.035),uNight);
+   deep=mix(deep,vec3(.11,.06,.055),uVil*.8);          // 苗寨段夕照暖水色
+   deep=mix(deep,vec3(.03,.055,.11),uVil2*.8);         // 第二段：旧暮蓝水色
+   vec3 silver=mix(vec3(1.,.95,.8),vec3(.78,.88,.9),uNight);
+   silver=mix(silver,vec3(1.,.78,.5),uVil*.5);
+   silver=mix(silver,vec3(1.,.85,.6),uVil2*.5);
+   vec3 col=deep;
+   float n=fbmg(vW.xz*vec2(2.2,.8)+vec2(0.,uT*.7));
+   col+=silver*.08*n;
+   float spk=pow(noiseg(vW.xz*vec2(9.,4.)+vec2(0.,uT*2.2)),9.);
+   col+=silver*spk*1.6*(.3+.7*uSec+.5*uHigh);
+   // 月光水路 moonlit path — broken silver toward the moon
+   vec2 toP=vW.xz-cameraPosition.xz;
+   float dl2=max(length(toP),.001);
+   float align=pow(max(dot(toP/dl2,normalize(uMoon.xz)),0.),20.);
+   float glit=pow(noiseg(vW.xz*vec2(5.,2.2)+vec2(uT*.9,uT*.13)),5.);
+   col+=vec3(.8,.88,1.)*align*(.10+glit*1.5)*uNight*smoothstep(60.,15.,dl2);
+   // raindrop rings
+   vec2 cell=floor(vW.xz*1.4);
+   float ph=uT*.9+hashg(cell)*7.;
+   float f=fract(ph);
+   vec2 cp=(cell+.5+vec2(hashg(cell+1.3),hashg(cell+2.7))-.5)/1.4;
+   float rr=f*.6*(.6+.6*uBeat+.5*uHigh);
+   col+=silver*smoothstep(.05,.0,abs(length(vW.xz-cp)-rr))*(1.-f)*.35;
+   // 赤足点水 · 银铃落水 — expanding rings from the dancer's touches
+   for(int i=0;i<6;i++){
+    float age=uT-uRip[i].z;
+    if(age>0.&&age<2.2){
+     float rr2=length(vW.xz-uRip[i].xy);
+     float rad2=.15+age*1.35;
+     col+=silver*smoothstep(.16,.02,abs(rr2-rad2))*exp(-age*1.8)*uRip[i].w*.9;
+    }
+   }
+   // 苗寨灯影 — warm lamplight broken on the water (village stretch)
+   float vil=smoothstep(-64.,-54.,vW.z)*(1.-smoothstep(24.,30.,vW.z));
+   float bank=smoothstep(1.0,2.9,abs(vW.x));
+   float str=pow(noiseg(vec2(vW.x*7.,vW.z*.6+uT*.35)),2.)
+            *pow(noiseg(vec2(vW.x*3.1+7.,vW.z*.25-uT*.22)),2.);
+   col+=vec3(1.,.55,.22)*str*vil*bank*2.6*(.7+.3*sin(uT*2.7+vW.x*9.));
+   // view fresnel toward sky tint
+   vec3 vd=normalize(cameraPosition-vW);
+   col+=mix(vec3(.5,.68,.55),vec3(.2,.32,.3),uNight)*pow(1.-abs(vd.y),3.)*.5;
+   float d=length(cameraPosition-vW);
+   float fog=1.-exp(-d*d*uFogD*uFogD*2.2);
+   col=mix(col,uFogC,fog);
+   gl_FragColor=vec4(col,.94*uApp);
+  }`});
+ const w=new THREE.Mesh(g,m); w.position.set(0,-0.35,-170); scene.add(w);
+}
+
+/* ============================================================
+   forest 针叶林 (instanced, 3 tiers) + bamboo 竹丛 + mountains 群峰
+============================================================ */
+const sinkables=[];   // forest that sinks away when the ghost trees rise 幻树升起时沉落的林木
+const canSrc=[];      // 树冠采样点 [x,y,z,rx,ry,type] — 供粒子冠层生成
+const vegU=[];        // 植被注入着色 uniforms（每帧驱动）
+function vegify(mat,o){ // 风场顶点动画+竹节纹+夜间轮廓光 o:{hk高度权重,amp摆幅,bow静弯,node竹节}
+ mat.customProgramCacheKey=()=>'veg'+JSON.stringify(o); // 参数不同→独立着色程序
+ mat.onBeforeCompile=sh=>{
+  sh.uniforms.uVT={value:0};sh.uniforms.uVW={value:0};sh.uniforms.uVR={value:0};
+  vegU.push(sh.uniforms);
+  sh.vertexShader=('uniform float uVT,uVW;varying float vObjY;\n'+sh.vertexShader)
+   .replace('#include <begin_vertex>',`#include <begin_vertex>
+    vObjY=transformed.y;
+    #ifdef USE_INSTANCING
+    {
+     vec3 iw=vec3(instanceMatrix[3][0],instanceMatrix[3][1],instanceMatrix[3][2]);
+     float hw=clamp(transformed.y*${o.hk.toFixed(3)}+.5,0.,1.);
+     float ph=iw.x*.73+iw.z*.91;
+     float gust=sin(uVT*1.6+ph)+.55*sin(uVT*2.7+ph*1.31)+.3*sin(uVT*4.1+ph*.7);
+     float b=uVW*hw*hw*${o.amp.toFixed(3)};
+     transformed.x+=b*gust*.34+hw*hw*sin(ph*3.7)*${o.bow.toFixed(3)};
+     transformed.z+=b*.22*sin(uVT*1.25+ph*1.7);
+    }
+    #endif`);
+  sh.fragmentShader=('uniform float uVR;varying float vObjY;\n'+sh.fragmentShader)
+   .replace('#include <emissivemap_fragment>',`#include <emissivemap_fragment>
+    ${o.node?`{float nd=smoothstep(.90,.99,sin(vObjY*4.4+1.2));
+     diffuseColor.rgb*=1.-nd*.30;}`:''}
+    {float rim=pow(1.-clamp(dot(normalize(vViewPosition),normal),0.,1.),3.);
+     totalEmissiveRadiance+=vec3(.07,.13,.17)*rim*uVR;}`);
+ };
+}
+const treeMat=new THREE.MeshStandardMaterial({color:0xffffff,roughness:1});
+vegify(treeMat,{hk:.33,amp:.55,bow:0,node:0});        // 针叶树:稳重的摇
+function instancedCones(r,h,yOff,count){
+ const m=new THREE.InstancedMesh(new THREE.ConeGeometry(r,h,7),treeMat,count);
+ m.userData.yOff=yOff; return m;
+}
+{
+ const NT=1250;
+ const tiers=[instancedCones(1.5,3.6,1.8,NT),instancedCones(1.05,3.0,3.9,NT),
+              instancedCones(0.62,2.2,5.7,NT)];
+ const M=new THREE.Matrix4(),Q=new THREE.Quaternion(),S=new THREE.Vector3(),P=new THREE.Vector3();
+ const cA=new THREE.Color(0x0d2917),cB=new THREE.Color(0x1c4226);
+ for(let i=0;i<NT;i++){
+  const side=(i%2===0)?-1:1;                       // both banks, evenly 两岸都有
+  const z=45-Math.random()*470;                    // covers behind the start too
+  const vil=z>-62?12:0;                            // 苗寨段树林退后，让出寨子
+  const x=side*(6.0+vil+Math.pow(Math.random(),1.5)*46);
+  const y=groundH(x,z)-.4;
+  const s=.75+Math.random()*1.7;
+  Q.setFromAxisAngle(new THREE.Vector3(0,1,0),Math.random()*6.28);
+  S.set(s,s*(0.85+Math.random()*.5),s);
+  canSrc.push(x,y+3.9*S.y,z,1.55*s,2.9*S.y,0);     // 冠层采样:针叶
+  const col=cA.clone().lerp(cB,Math.random());
+  for(const t of tiers){
+   P.set(x,y+t.userData.yOff*S.y,z);
+   M.compose(P,Q,S); t.setMatrixAt(i,M); t.setColorAt(i,col);
+  }
+ }
+ tiers.forEach(t=>{t.instanceMatrix.needsUpdate=true;
+  if(t.instanceColor)t.instanceColor.needsUpdate=true;scene.add(t);});
+ sinkables.push(...tiers);
+}
+{ // bamboo
+ const NB=300;
+ const bmat=new THREE.MeshStandardMaterial({color:0xffffff,roughness:1});
+ vegify(bmat,{hk:.143,amp:1.5,bow:.30,node:1});    // 竹:柔摆·自然弯·竹节纹
+ const bam=new THREE.InstancedMesh(new THREE.CylinderGeometry(.05,.075,7,5),bmat,NB);
+ const M=new THREE.Matrix4(),Q=new THREE.Quaternion(),E=new THREE.Euler();
+ const cA=new THREE.Color(0x2e5a30),cB=new THREE.Color(0x487a42);
+ for(let i=0;i<NB;i++){
+  const side=Math.random()<.5?-1:1;
+  const x=side*(3.6+Math.random()*3.2);
+  const z=15-Math.random()*380;
+  E.set((Math.random()-.5)*.22,0,(Math.random()-.5)*.22);
+  Q.setFromEuler(E);
+  const sy=.8+Math.random()*.6;
+  M.compose(new THREE.Vector3(x,groundH(x,z)+3.1,z),Q,
+   new THREE.Vector3(1,sy,1));
+  canSrc.push(x,groundH(x,z)+3.1+3.2*sy,z,.8,1.2,1); // 冠层采样:竹梢
+  bam.setMatrixAt(i,M); bam.setColorAt(i,cA.clone().lerp(cB,Math.random()));
+ }
+ bam.instanceMatrix.needsUpdate=true;
+ if(bam.instanceColor)bam.instanceColor.needsUpdate=true;
+ scene.add(bam);sinkables.push(bam);
+}
+{ // bamboo corridor + clearing ring 竹林长廊 · 舞潭竹环 (with leaf crowns)
+ const NG=1050,RING=300;
+ const smat=new THREE.MeshStandardMaterial({color:0xffffff,roughness:1});
+ vegify(smat,{hk:.111,amp:1.6,bow:.35,node:1});    // 竹廊竹竿:大摆·弯竿·竹节
+ const cmat=new THREE.MeshStandardMaterial({color:0xffffff,roughness:1,flatShading:true});
+ vegify(cmat,{hk:.36,amp:2.0,bow:.2,node:0});      // 竹冠:梢头甩动最大
+ const stalks=new THREE.InstancedMesh(new THREE.CylinderGeometry(.05,.08,9,5),smat,NG);
+ const crowns=new THREE.InstancedMesh(new THREE.ConeGeometry(.8,2.8,5),cmat,NG);
+ const M=new THREE.Matrix4(),Q=new THREE.Quaternion(),E=new THREE.Euler(),
+       S=new THREE.Vector3(),P=new THREE.Vector3();
+ const cA=new THREE.Color(0x2c5c30),cB=new THREE.Color(0x4d7f44);
+ const lA=new THREE.Color(0x143a1e),lB=new THREE.Color(0x2e5e2c);
+ for(let i=0;i<NG;i++){
+  let x,z;
+  if(i<NG-RING){                                   // corridor along the walk 竹廊
+   z=-48-Math.random()*106;
+   x=Math.random()<.5? -(4.0+Math.pow(Math.random(),2)*10)
+                     : pathX(z)+2.0+Math.pow(Math.random(),2)*10;
+  }else{                                           // dense ring around the dance pool
+   const a=Math.random()*6.283,r=6+Math.pow(Math.random(),1.6)*10;
+   x=Math.cos(a)*r; z=-161+Math.sin(a)*r;
+   if(Math.abs(x)<4.2)x=(x<0?-1:1)*(4.2+Math.random()*2.5);
+  }
+  const sy=.75+Math.random()*.75;
+  const lean=(x>pathX(z)?1:-1)*(.05+Math.random()*.16); // tips arch over the path
+  E.set((Math.random()-.5)*.1,0,lean); Q.setFromEuler(E);
+  const y=groundH(x,z);
+  S.set(1,sy,1);
+  P.set(x,y+4.5*sy-.3,z);
+  M.compose(P,Q,S);
+  stalks.setMatrixAt(i,M); stalks.setColorAt(i,cA.clone().lerp(cB,Math.random()));
+  P.set(x-Math.sin(lean)*4.5*sy,y+4.5*sy-.3+Math.cos(lean)*3.6*sy,z);
+  S.set(.8+Math.random()*.8,.8+Math.random()*.6,.8+Math.random()*.8);
+  M.compose(P,Q,S);
+  crowns.setMatrixAt(i,M); crowns.setColorAt(i,lA.clone().lerp(lB,Math.random()));
+  canSrc.push(P.x,P.y,P.z,1.0,1.35,1);              // 冠层采样:竹廊梢
+ }
+ for(const o of[stalks,crowns]){o.instanceMatrix.needsUpdate=true;
+  if(o.instanceColor)o.instanceColor.needsUpdate=true;scene.add(o);}
+ sinkables.push(stalks,crowns);
+}
+
+/* ============================================================
+   粒子冠层 — 每棵树冠一团微光针叶/竹叶 随风波动 雷闪即亮
+============================================================ */
+const canopyU={uT:{value:0},uW:{value:0},uB:{value:0},uN:{value:0},uPx:{value:1}};
+{
+ const pp=[],ss=[],tt=[];
+ for(let c=0;c<canSrc.length;c+=6){
+  const x=canSrc[c],y=canSrc[c+1],z=canSrc[c+2],
+        rx=canSrc[c+3],ry=canSrc[c+4],ty=canSrc[c+5];
+  const K=ty?32:64;                                 // 针叶密 竹梢疏
+  for(let k=0;k<K;k++){
+   const u1=Math.random()*2-1,a2=Math.random()*6.283,rr=Math.cbrt(Math.random());
+   const sxy=Math.sqrt(1-u1*u1);
+   pp.push(x+Math.cos(a2)*sxy*rr*rx, y+u1*rr*ry, z+Math.sin(a2)*sxy*rr*rx);
+   ss.push(Math.random(),Math.random(),Math.random(),(u1*rr+1)*.5); // w=冠内高度权重
+   tt.push(ty);
+  }
+ }
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(pp),3));
+ g.setAttribute('aS',new THREE.BufferAttribute(new Float32Array(ss),4));
+ g.setAttribute('aT',new THREE.BufferAttribute(new Float32Array(tt),1));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,
+  blending:THREE.AdditiveBlending,uniforms:canopyU,
+  vertexShader:`
+  attribute vec4 aS;attribute float aT;
+  uniform float uT,uW,uB,uN,uPx;
+  varying float vA;varying vec3 vC;
+  void main(){
+   float ph=position.x*.73+position.z*.91;
+   float gust=sin(uT*1.6+ph)+.55*sin(uT*2.7+ph*1.31);
+   vec3 p=position;
+   p.x+=(gust*.13+sin(uT*(2.2+aS.x*2.)+aS.y*40.)*.06)*(.4+.6*aS.w)*uW*2.2;
+   p.z+=sin(uT*(1.9+aS.y*1.5)+aS.z*30.)*.05*uW*2.;
+   p.y+=sin(uT*(1.4+aS.z)+aS.x*20.)*.03;
+   vec4 mv=modelViewMatrix*vec4(p,1.);
+   float d=-mv.z;
+   gl_PointSize=clamp((.05+.06*aS.x)*uPx/max(d,.5),1.,4.5);
+   float tw=.55+.45*sin(uT*(1.+aS.y*2.4)+aS.z*40.);
+   vA=tw*(.05+.09*aS.x)*smoothstep(150.,60.,d)*smoothstep(2.5,6.,d)*(1.+uB*2.2);
+   vec3 conif=mix(vec3(.05,.16,.09),vec3(.11,.26,.14),aS.z);
+   vec3 bamb =mix(vec3(.16,.36,.13),vec3(.30,.50,.20),aS.z);
+   vC=mix(conif,bamb,aT);
+   vC=vC*(1.-uN*.5)+vec3(.03,.055,.075)*uN;         // 夜里泛冷微光
+   vC+=vec3(.5,.42,.72)*uB*.5;                      // 雷闪瞬间照亮整片冠层
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;varying vec3 vC;
+  void main(){
+   vec2 q=gl_PointCoord-.5;float dd=length(q);
+   float m2=exp(-dd*dd*10.)*smoothstep(.5,.26,dd);
+   gl_FragColor=vec4(vC*m2*vA*3.5,1.);
+  }`});
+ const cp=new THREE.Points(g,m);
+ cp.renderOrder=3;cp.frustumCulled=false;scene.add(cp);
+ sinkables.push(cp);                                // 随林同沉
+}
+
+let padsM=null;         // 浮萍引用（漂动用）
+{ // 浮萍 duckweed resting on the water 「闷不吭声的浮萍」
+ const NP=150;
+ const pads=new THREE.InstancedMesh(new THREE.CircleGeometry(.3,7),
+  new THREE.MeshStandardMaterial({color:0x33632f,roughness:1}),NP);
+ const M=new THREE.Matrix4(),S=new THREE.Vector3(),
+       Q=new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI/2,0,0));
+ for(let i=0;i<NP;i++){
+  const pool=i<90;                                 // most gather around the dance pool
+  const x=(Math.random()-.5)*(pool?6.2:5.4);
+  const z=pool?-149-Math.random()*24:20-Math.random()*300;
+  const s=.45+Math.random()*1.1;
+  S.set(s,s,s);
+  M.compose(new THREE.Vector3(x,-0.32,z),Q,S);
+  pads.setMatrixAt(i,M);
+ }
+ pads.instanceMatrix.needsUpdate=true; scene.add(pads);
+ padsM=pads;
+}
+{ // karst peaks 嶙峋喀斯特 — noise-carved silhouettes, all around (front & behind)
+ const mMat=new THREE.MeshStandardMaterial({color:0x1a3526,roughness:1,flatShading:true});
+ vegify(mMat,{hk:.1,amp:0,bow:0,node:0});          // 只取夜间天际线轮廓光
+ function makeMountain(){
+  const g=new THREE.ConeGeometry(1,1,10,8);
+  const pos=g.attributes.position,seed=Math.random()*100;
+  for(let i=0;i<pos.count;i++){
+   const x=pos.getX(i),y=pos.getY(i),z=pos.getZ(i);
+   const r=Math.hypot(x,z);
+   if(r>0.005){
+    const a=Math.atan2(z,x);
+    const n=noise2(Math.cos(a)*2.2+seed,y*3.4+seed)
+          +.5*noise2(a*1.7+seed*2.1,y*7.3+seed);
+    const k=Math.max(1+(n-.75)*1.1,.25);
+    pos.setX(i,x*k);pos.setZ(i,z*k);
+   }
+   pos.setY(i,y+(noise2(Math.atan2(z,x)*2.5+seed,seed+y*2.)-.5)*.14);
+  }
+  g.computeVertexNormals();return g;
+ }
+ for(let i=0;i<20;i++){
+  const side=(i%2===0)?-1:1;
+  const x=side*(42+Math.random()*170);
+  const z=90-Math.random()*560;                    // ring extends behind the start
+  const h=65+Math.random()*130,r=18+Math.random()*32;
+  const m=new THREE.Mesh(makeMountain(),mMat);
+  m.position.set(x,h*.35,z);
+  m.scale.set(r,h,r);
+  m.rotation.y=Math.random()*6.28;
+  scene.add(m);
+ }
+}
+
+/* ============================================================
+   苗寨夜灯水乡 — stilt village with lamplit windows (0–51s)
+============================================================ */
+const lampU={uT:{value:0},uPx:{value:1},uCrush:{value:0}}; // uCrush=「窗帘揉碎灯影」窗口
+const chimneys=[];      // 炊烟出烟口
+{
+ const NH=22;
+ const woodA=new THREE.Color(0x9a7448),woodB=new THREE.Color(0x6f4e30);
+ const bodies=new THREE.InstancedMesh(new THREE.BoxGeometry(1,1,1),
+  new THREE.MeshStandardMaterial({color:0xffffff,roughness:.95,emissive:0x3a2412}),NH);
+ const roofs=new THREE.InstancedMesh(new THREE.ConeGeometry(1,1,4),
+  new THREE.MeshStandardMaterial({color:0x55636f,roughness:1,flatShading:true,
+   emissive:0x131a22}),NH*2);
+ const stilts=new THREE.InstancedMesh(new THREE.CylinderGeometry(.09,.12,1,5),
+  new THREE.MeshStandardMaterial({color:0x6c4e30,roughness:1,emissive:0x1e1408}),NH*4);
+ const decks=new THREE.InstancedMesh(new THREE.BoxGeometry(1,.12,1.3),
+  new THREE.MeshStandardMaterial({color:0x8c684a,roughness:1,emissive:0x2a1a0a}),NH);
+ const winQuads=new THREE.InstancedMesh(new THREE.PlaneGeometry(.6,.75),
+  new THREE.MeshBasicMaterial({color:0xffd490,side:THREE.DoubleSide}),NH*4);
+ const M=new THREE.Matrix4(),Q=new THREE.Quaternion(),Q2=new THREE.Quaternion(),
+       E=new THREE.Euler(),S=new THREE.Vector3(),ZERO=new THREE.Matrix4().makeScale(0,0,0);
+ const lampPos=[],lampInf=[];               // 窗灯/灯笼 glow points [kind, rand]
+ const lamp=(x,y,z,k)=>{lampPos.push(x,y,z);lampInf.push(k,Math.random());};
+ let si=0,wi=0,ri=0;
+ for(let i=0;i<NH;i++){
+  const side=i%2?-1:1;
+  const z=22-i*3.5-Math.random()*2;
+  const x=side*(6.5+Math.random()*7);
+  const gy=groundH(x,z);
+  const w=3+Math.random()*2.2,dp=2.6+Math.random()*1.4,hh=2.2+Math.random()*.8;
+  const yaw=(side>0?-1:1)*Math.PI/2+(Math.random()-.5)*.3;  // face the river 面河而立
+  const floorY=gy+1.5+Math.random()*.8;
+  Q.setFromEuler(E.set(0,yaw,0));
+  S.set(w,hh,dp);
+  M.compose(new THREE.Vector3(x,floorY+hh/2,z),Q,S);
+  bodies.setMatrixAt(i,M);
+  const near=i<6;                                           // 最前几栋走近细看
+  const wcol=woodA.clone().lerp(woodB,Math.random());
+  if(near)wcol.multiplyScalar(1.4);                         // 前排提亮
+  bodies.setColorAt(i,wcol);
+  if(near&&i%2===0){                                        // 前排暖光点灯
+   const pl=new THREE.PointLight(0xffc37a,3,25,1.2);
+   pl.position.set(x-side*(dp/2+1.),floorY+1.4,z);
+   scene.add(pl);
+  }
+  Q2.setFromEuler(E.set(0,yaw+Math.PI/4,0));                // align pyramid roof
+  const rh=1+hh*.45;
+  S.set(w*.98,rh,dp*.98);
+  M.compose(new THREE.Vector3(x,floorY+hh+rh/2,z),Q2,S);
+  roofs.setMatrixAt(ri++,M);
+  if(Math.random()<.5){                                     // 重檐 upper roof tier
+   S.set(w*.5,rh*.6,dp*.5);
+   M.compose(new THREE.Vector3(x,floorY+hh+rh*.95,z),Q2,S);
+   roofs.setMatrixAt(ri++,M);
+  }else roofs.setMatrixAt(ri++,ZERO);
+  if(i%4===1)chimneys.push(x-w*.2,floorY+hh+rh+.15,z+dp*.15);  // 炊烟位
+  const cy2=Math.cos(yaw),sy2=Math.sin(yaw);
+  for(const[dx,dz]of[[-w/2+.3,-dp/2+.3],[w/2-.3,-dp/2+.3],
+                     [-w/2+.3,dp/2-.3],[w/2-.3,dp/2-.3]]){   // 吊脚 corner stilts
+   const cx=x+dx*cy2+dz*sy2,cz=z-dx*sy2+dz*cy2;
+   const gy2=groundH(cx,cz),ht=Math.max(floorY-gy2+.3,.5);
+   S.set(1,ht,1);
+   M.compose(new THREE.Vector3(cx,gy2+ht/2-.15,cz),Q,S);
+   stilts.setMatrixAt(si++,M);
+  }
+  S.set(w*.92,1,1);                                          // 临河廊台 porch deck
+  M.compose(new THREE.Vector3(x-side*(dp/2+.62),floorY-.06,z),Q,S);
+  decks.setMatrixAt(i,M);
+  const nw=(near?2:1)+Math.floor(Math.random()*3);           // 亮窗（前排更多）
+  for(let k2=0;k2<nw&&wi<NH*4;k2++){
+   const wy=floorY+.95+Math.random()*.85,wz=z+(Math.random()-.5)*w*.55;
+   S.set(1,1,1);
+   M.compose(new THREE.Vector3(x-side*(dp/2+.03),wy,wz),Q,S);
+   winQuads.setMatrixAt(wi++,M);
+   lamp(x-side*(dp/2+.22),wy,wz,0);                          // halo hugging the window
+  }
+  if(Math.random()<.85)                                      // 檐下红灯笼
+   lamp(x-side*(dp/2+.55),floorY+hh+.15,z+(Math.random()-.5)*w*.5,1);
+ }
+ while(wi<NH*4)winQuads.setMatrixAt(wi++,ZERO);
+ for(let i=0;i<10;i++){                                      // 沿路的灯笼杆
+  const z=18-i*6.5-Math.random()*3,x=pathX(z)+(i%2?-1.7:1.7);
+  lamp(x,groundH(x,z)+2.1,z,1);
+ }
+ if(bodies.instanceColor)bodies.instanceColor.needsUpdate=true;
+ scene.add(bodies,roofs,stilts,decks,winQuads);
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(lampPos),3));
+ g.setAttribute('aL',new THREE.BufferAttribute(new Float32Array(lampInf),2));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,
+  blending:THREE.AdditiveBlending,uniforms:lampU,
+  vertexShader:`
+  attribute vec2 aL;
+  uniform float uT,uPx,uCrush;
+  varying float vA; varying float vK;
+  void main(){
+   vec3 w=position;
+   w.x+=sin(uT*1.2+aL.y*30.)*.07*aL.x;        // lanterns sway 灯笼摇曳
+   w.y+=cos(uT*1.6+aL.y*20.)*.03*aL.x;
+   w.x+=(sin(uT*8.+aL.y*90.)*.20+sin(uT*13.+aL.y*47.)*.11)*uCrush; // 窗帘揉碎灯影: 光斑被撕扯
+   w.y+=cos(uT*10.+aL.y*70.)*.09*uCrush;
+   vec4 mv=viewMatrix*vec4(w,1.);
+   float d=-mv.z;
+   gl_PointSize=min((.95+aL.x*.2)*uPx/max(d,.5),60.);
+   float fl=.78+(.22+.55*uCrush)*sin(uT*(2.+aL.y*3.+6.*uCrush)+aL.y*40.); // 揉碎时明灭加深加急
+   vA=fl*1.7*smoothstep(95.,35.,d)*smoothstep(.2,2.,d);
+   vK=aL.x;
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA; varying float vK;
+  void main(){
+   vec2 q=gl_PointCoord-.5;
+   float dd=length(q);
+   float m=exp(-dd*dd*9.)*smoothstep(.5,.26,dd);
+   float core=exp(-dd*dd*40.);
+   vec3 warm=mix(vec3(1.,.72,.36),vec3(1.,.32,.14),vK);  // 窗灯暖黄 / 灯笼红
+   gl_FragColor=vec4((warm*m+vec3(1.,.9,.7)*core*.8)*vA,1.);
+  }`});
+ const lamps=new THREE.Points(g,m);
+ lamps.frustumCulled=false;scene.add(lamps);
+}
+
+const weather=createWeatherMaterials(THREE,scene,{groundH,chimneys,GLSL_NOISE});
+const {fireU,smokeU,leafU,rainU,splashU,mistU}=weather;
+
+/* ============================================================
+   蝶 · particle butterfly guide (3D wings, flap around body axis)
+============================================================ */
+function rotJ(x,y,a){const c=Math.cos(a),s=Math.sin(a);return[c*x-s*y,s*x+c*y];}
+function wingDJ(ax,ay){
+ const[ux,uy]=rotJ(ax-.34,ay-.15,-.55);const du=Math.hypot(ux/.42,uy/.23)-1;
+ const[lx,ly]=rotJ(ax-.23,ay+.16,.45);const dl=Math.hypot(lx/.30,ly/.21)-1;
+ const ds=Math.hypot((ax-.15)/.045,(ay+.36)/.17)-1;
+ return Math.min(du,dl,ds);
+}
+const bfArr=[];
+const bfPush=(k,ox,oy)=>bfArr.push(ox,oy,Math.random(),Math.random(),Math.random(),k);
+{
+ let mem=0,edg=0,guard=0;
+ while((mem<480||edg<700)&&guard++<900000){
+  const ax=Math.random()*.92,ay=Math.random()*1.15-.62;
+  const d=wingDJ(ax,ay),sx=(Math.random()<.5?-1:1)*ax;
+  if(Math.abs(d)<.02&&edg<700){bfPush(1,sx,ay);edg++;}
+  else if(d<-.03&&mem<480&&Math.random()<.35){bfPush(0,sx,ay);mem++;}
+ }
+ for(let s=-1;s<=1;s+=2)for(let v=0;v<7;v++){
+  const a=-1.05+v*.36+(Math.random()-.5)*.06,dx=Math.cos(a),dy=Math.sin(a);
+  for(let tt=.06;tt<.95;tt+=.022){
+   const ax=.05+dx*tt,ay=.02+dy*tt;
+   if(wingDJ(ax,ay)<-.015)bfPush(1,s*(ax+(Math.random()-.5)*.006),ay+(Math.random()-.5)*.006);
+  }
+ }
+ for(let i=0;i<110;i++)bfPush(2,(Math.random()-.5)*.055,-.16+Math.random()*.28);
+ for(let i=0;i<40;i++){const a=Math.random()*6.283,r=.032*Math.sqrt(Math.random());
+  bfPush(2,Math.cos(a)*r,.14+Math.sin(a)*r);}
+ for(let s=-1;s<=1;s+=2)for(let i=0;i<30;i++){const tt=i/29;
+  bfPush(3,s*(.012+.082*tt)+(Math.random()-.5)*.008,.16+.145*tt+(Math.random()-.5)*.008);}
+}
+const BFN=bfArr.length/6;
+const bfU={uT:{value:0},uBPos:{value:new THREE.Vector3()},uFlap:{value:1},
+ uYaw:{value:0},uBank:{value:0},uScat:{value:0},uFig:{value:0},uRed:{value:0},
+ uNight:{value:0},uBeat:{value:0},uPx:{value:1},uGrow:{value:0},uMirA:{value:1},
+ uFigM:{value:0},uTint:{value:new THREE.Vector3(1,1,1)}};
+const bf2U={uT:{value:0},uBPos:{value:new THREE.Vector3()},uFlap:{value:1},
+ uYaw:{value:0},uBank:{value:0},uScat:{value:0},uFig:{value:0},uRed:{value:0},
+ uNight:{value:0},uBeat:{value:0},uPx:{value:1},uGrow:{value:0},uMirA:{value:1},
+ uFigM:{value:0},uTint:{value:new THREE.Vector3(2.4,1.05,1.2)}};   // 泪蝶：冰白微粉 uFigM=仅倒影预兆
+{
+ const off=new Float32Array(BFN*2),rand=new Float32Array(BFN*4);
+ for(let i=0;i<BFN;i++){
+  off[i*2]=bfArr[i*6]; off[i*2+1]=bfArr[i*6+1];
+  rand[i*4]=bfArr[i*6+2];rand[i*4+1]=bfArr[i*6+3];
+  rand[i*4+2]=bfArr[i*6+4];rand[i*4+3]=bfArr[i*6+5];
+ }
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(BFN*3),3));
+ g.setAttribute('aOff',new THREE.BufferAttribute(off,2));
+ g.setAttribute('aRand',new THREE.BufferAttribute(rand,4));
+ const mkM=(mirror,U)=>new THREE.ShaderMaterial({transparent:true,depthWrite:false,
+  depthTest:false,                      // 她是梦，永远不被山林遮住
+  blending:THREE.AdditiveBlending,uniforms:U,
+  vertexShader:`
+  attribute vec2 aOff; attribute vec4 aRand;
+  uniform float uT,uFlap,uYaw,uBank,uScat,uFig,uFigM,uBeat,uPx,uGrow,uMirA;
+  uniform vec3 uBPos;
+  varying float vA; varying float vBand; varying vec4 vR; varying float vSc;
+  void main(){
+   float kind=aRand.w;
+   float isEdge=step(.5,kind)-step(1.5,kind);
+   float isBody=step(1.5,kind);
+   vec2 o=aOff;
+   // 3D flap: wings rotate up around the body (forward) axis
+   float flapAng=(1.-uFlap)*1.15+.10;
+   vec3 lp;
+   float wx=abs(o.x);
+   lp.x=sign(o.x)*wx*cos(flapAng);
+   lp.y=wx*sin(flapAng)*.9;
+   lp.z=-o.y;
+   if(kind>1.5) lp=vec3(o.x,0.,-o.y);
+   // flutter
+   lp+=.02*mix(1.,.3,isBody)*vec3(sin(uT*(2.+aRand.x*6.)+aRand.y*40.),
+     cos(uT*(1.7+aRand.z*6.)+aRand.x*40.),sin(uT*(2.3+aRand.y*5.)+aRand.z*30.));
+   // 叮: only some particles shake off as fading silver sparks 银饰抖落，蝶形不散
+   float sc=pow(uScat,.8);
+   float fly=step(.55,fract(aRand.x*13.7+aRand.y*7.3));
+   float scAmt=sc*fly;
+   vec3 dir3=normalize(vec3(o.x,(aRand.x-.5)*1.4,-o.y*.3)+vec3(1e-4));
+   lp+=dir3*(0.8+aRand.y*1.2)*scAmt*1.6;
+   vSc=scAmt;
+   lp*=1.05*(1.+.06*uBeat)*(1.+uGrow*2.4); // 青蝶缓缓放大到3.5倍
+   // bank roll (around forward z) then yaw
+   float cb=cos(uBank),sb=sin(uBank);
+   lp.xy=mat2(cb,-sb,sb,cb)*lp.xy;
+   float cy=cos(uYaw),sy=sin(uYaw);
+   lp.xz=mat2(cy,-sy,sy,cy)*lp.xz;
+   vec3 w=uBPos+lp;
+   ${mirror?`w.y=-.70-w.y;                        // 水面倒影 mirrored below y=-0.35
+   w.x+=sin(uT*2.6+w.z*2.2)*.07;w.z+=sin(uT*2.1+w.x*3.1)*.05;`:''}
+   vec4 mv=viewMatrix*vec4(w,1.);
+   float d=-mv.z;
+   float szw=(.028+isEdge*.019+isBody*.030)*(.8+aRand.z*.9)*(1.+scAmt*.25)
+     *(1.+uGrow*1.6);                                 // 粒子随蝶同步变大
+   gl_PointSize=min(szw*uPx/max(d,.5),14.);          // never blows up in your face
+   vBand=.5+.5*sin(length(o)*22.-uT*1.2+aRand.y*3.);
+   vR=vec4(isEdge,isBody,aRand.x,aRand.y);
+   float twk=.72+.28*sin(uT*(4.+aRand.x*6.)+aRand.y*50.);
+   vA=${mirror?'max(uFig,uFigM)':'uFig'}*twk*(.28+.72*isEdge+.5*isBody)*(.62+.38*uFlap)
+     *(1.-scAmt*.72)                                  // sparks die out, don't blind
+     *smoothstep(1.1,2.8,d)                           // 贴脸即隐 — 近处不糊成粒子团
+     ${mirror?'*smoothstep(5.2,4.6,abs(w.x))*.32*uMirA':''};   // 倒影只在有水时(湖已外扩)
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA; varying float vBand; varying vec4 vR; varying float vSc;
+  uniform float uNight,uRed;
+  uniform vec3 uTint;
+  void main(){
+   vec2 q=gl_PointCoord-.5;
+   float d=length(q);
+   float m=exp(-d*d*16.)*smoothstep(.5,.3,d);
+   vec3 wc=mix(vec3(.16,.96,.88),vec3(.42,.88,1.05),vBand);  // 青蝶
+   wc=mix(wc,vec3(.86,.94,.98),.12+vR.x*.45+vR.y*.68);
+   wc*=mix(vec3(1.12,1.05,.92),vec3(1.),uNight);  // warm shimmer in daylight
+   wc=mix(wc,vec3(.92,.97,1.),vSc*.8);    // 叮 — 银饰炸开成银白
+   wc=mix(wc,vec3(.52,1.,.96),uRed);      // 封印时燃成青白，与红树相映
+   wc*=uTint;                             // 双蝶配色（青 / 泪白）
+   gl_FragColor=vec4(wc*m*vA,1.);
+  }`});
+ for(const U of[bfU,bf2U])for(const mirror of[false,true]){ // 双蝶 × (本体+倒影)
+  const bfObj=new THREE.Points(g,mkM(mirror,U));
+  bfObj.renderOrder=mirror?7:9;          // reflection under, body on top
+  bfObj.frustumCulled=false; scene.add(bfObj);
+ }
+}
+
+/* ============================================================
+   蝶尾光迹 trail — fading cyan ribbon behind the dancer
+============================================================ */
+const TRN=180;
+const trailU={uT:{value:0},uPx:{value:1}};
+let trI=0;
+const trGeo=new THREE.BufferGeometry();
+trGeo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(TRN*3),3));
+{
+ const d0=new Float32Array(TRN*2);
+ for(let i=0;i<TRN;i++)d0[i*2]=-99;               // [t0, amp] — start dead
+ trGeo.setAttribute('aD',new THREE.BufferAttribute(d0,2));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,depthTest:false,
+  blending:THREE.AdditiveBlending,uniforms:trailU,
+  vertexShader:`
+  attribute vec2 aD;
+  uniform float uT,uPx;
+  varying float vA;
+  void main(){
+   float age=max(uT-aD.x,0.);
+   vec4 mv=viewMatrix*vec4(position,1.);
+   float d=-mv.z;
+   gl_PointSize=min(.12*(1.-age*.42)*uPx/max(d,.5),20.);
+   vA=aD.y*exp(-age*1.9)*step(age,1.6);
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;
+  void main(){
+   vec2 q=gl_PointCoord-.5;
+   float dd=length(q);
+   float m=exp(-dd*dd*12.)*smoothstep(.5,.3,dd);
+   gl_FragColor=vec4(vec3(.30,.95,.92)*m*vA,1.);
+  }`});
+ const tr=new THREE.Points(trGeo,m);
+ tr.renderOrder=8;tr.frustumCulled=false;scene.add(tr);
+}
+
+/* ============================================================
+   河中蝶界 — 巨雷后1s河流显现(约15s)，水下仿佛另一个世界：
+   15 只青蝶漫游，每只都拖一条与主蝶同款的光尾
+============================================================ */
+const rvBfU={uT:{value:0},uApp:{value:0},uCamZ:{value:12},uPx:{value:1}};
+{
+ const RBF=15,TRL=70;                              // 15 只 × (蝶形 + 70 粒光尾)
+ const off=[],rnd=[],mk=[];
+ for(let k=0;k<RBF;k++){
+  for(let i=0;i<BFN;i++){                          // 蝶形复用主蝶采样
+   off.push(bfArr[i*6],bfArr[i*6+1]);
+   rnd.push(bfArr[i*6+2],bfArr[i*6+3],bfArr[i*6+4],bfArr[i*6+5]);
+   mk.push(k,-1);
+  }
+  for(let j=0;j<TRL;j++){                          // 光尾 = 回溯自身轨迹
+   off.push(0,0);rnd.push(Math.random(),Math.random(),Math.random(),0);
+   mk.push(k,.06+j/TRL*1.7);
+  }
+ }
+ const n=mk.length/2;
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(n*3),3));
+ g.setAttribute('aOff',new THREE.BufferAttribute(new Float32Array(off),2));
+ g.setAttribute('aR',new THREE.BufferAttribute(new Float32Array(rnd),4));
+ g.setAttribute('aM',new THREE.BufferAttribute(new Float32Array(mk),2));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,depthTest:false,
+  blending:THREE.AdditiveBlending,uniforms:rvBfU,
+  vertexShader:`
+  attribute vec2 aOff;attribute vec4 aR;attribute vec2 aM;
+  uniform float uT,uApp,uCamZ,uPx;
+  varying float vA;varying float vBand;varying float vTr;varying float vEg;
+  float hsh(float n){return fract(sin(n)*43758.5453);}
+  float riverX(float z){return sin(z*.017)*1.7+sin(z*.0065+1.4)*1.0+sin(z*.041)*.45;} // 河道中心线(与JS同源)
+  void main(){
+   float k=aM.x,tr=aM.y;                           // tr<0: 蝶身; tr≥0: 光尾回溯秒数
+   float h1=hsh(k*7.31),h2=hsh(k*13.77),h3=hsh(k*23.9);
+   float t=uT-max(tr,0.);                          // 尾迹 = 蝶在 t-tr 时刻的位置
+   float wx=.14+h1*.12,wz=.09+h2*.08,wy=.5+h3*.6;
+   float cz=uCamZ-4.5-h1*13.+sin(t*wz+h2*30.)*4.;  // 常驻镜头前方河段(近处可见)
+   vec3 ctr=vec3(
+     riverX(cz)+sin(t*wx+h1*40.)*(1.5+h2*1.3),     // 沿河心徘徊，限制在湖内(偏心<2.8)
+     -.70-(.3+h3*1.1+sin(t*wy+h3*20.)*.35),        // 水面之下的世界(浅层可见)
+     cz);
+   vec3 lp=vec3(0.);
+   float isEdge=0.,isBody=0.;
+   if(tr<0.){
+    float kind=aR.w;
+    isEdge=step(.5,kind)-step(1.5,kind);isBody=step(1.5,kind);
+    float flap=abs(sin(t*(2.3+h2*1.6)+k*2.7));     // 各自的振翅节奏
+    float flapAng=(1.-flap)*1.15+.10;
+    float wxo=abs(aOff.x);
+    lp.x=sign(aOff.x)*wxo*cos(flapAng);
+    lp.y=wxo*sin(flapAng)*.9;
+    lp.z=-aOff.y;
+    if(kind>1.5)lp=vec3(aOff.x,0.,-aOff.y);
+    lp+=.02*mix(1.,.3,isBody)*vec3(sin(uT*(2.+aR.x*6.)+aR.y*40.),
+      cos(uT*(1.7+aR.z*6.)+aR.x*40.),sin(uT*(2.3+aR.y*5.)+aR.z*30.));
+    lp*=(1.2+h2*.6)/3.;                            // 各只大小不一 — 缩为原来的1/3
+    float vx=cos(t*wx+h1*40.)*wx*(1.5+h2*1.2);     // 朝向 = 游动方向
+    float vz=cos(t*wz+h2*30.)*wz*5.;
+    float yaw=atan(vx,vz)+3.14159;
+    float cy=cos(yaw),sy=sin(yaw);
+    lp.xz=mat2(cy,-sy,sy,cy)*lp.xz;
+   }
+   vec3 w=ctr+lp;
+   w.x+=sin(uT*2.6+w.z*2.2)*.07;w.z+=sin(uT*2.1+w.x*3.1)*.05;  // 水下折射晃动
+   vec4 mv=viewMatrix*vec4(w,1.);
+   float d=-mv.z;
+   float szw=(tr<0.?(.028+isEdge*.019+isBody*.030)*(.8+aR.z*.9)
+                   :.11*(1.-tr*.42))/3.;           // 粒径同步缩1/3 — 稀疏度不变
+   gl_PointSize=min(szw*uPx/max(d,.5),12.);
+   vBand=.5+.5*sin(length(aOff)*22.-uT*1.2+aR.y*3.);
+   float twk=.72+.28*sin(uT*(4.+aR.x*6.)+aR.y*50.);
+   vA=uApp*(tr<0.?(.30+.70*isEdge+.5*isBody)*twk
+                 :exp(-tr*1.7)*(.5+.5*sin(uT*7.+aR.x*40.))*.9);
+   vA*=smoothstep(4.2,3.5,abs(w.x-riverX(w.z)));   // 只活在河道内(随河心)，不飞出湖面
+   vA*=smoothstep(1.5,3.,d)*smoothstep(90.,40.,d); // 近隐远淡
+   vA*=.28;                                        // 粒子能量降为1/3
+   vTr=max(tr,0.);vEg=isEdge;
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;varying float vBand;varying float vTr;varying float vEg;
+  void main(){
+   vec2 q=gl_PointCoord-.5;float dd=length(q);
+   float m2=exp(-dd*dd*14.)*smoothstep(.5,.3,dd);
+   vec3 wc=mix(vec3(.16,.96,.88),vec3(.42,.88,1.05),vBand);   // 主蝶同款青
+   wc=mix(wc,vec3(.86,.94,.98),vEg*.45);
+   wc=mix(wc,vec3(.30,.95,.92),step(.001,vTr));               // 光尾与主蝶尾同色
+   wc*=vec3(.8,.95,1.06);                                     // 水下青蓝滤色
+   gl_FragColor=vec4(wc*m2*vA,1.);
+  }`});
+ const o=new THREE.Points(g,m);
+ o.renderOrder=7;o.frustumCulled=false;scene.add(o);
+}
+
+/* ============================================================
+   泪 tear — 「滴滴答滴滴的雨下起 如你哭泣」
+   涌起→眼角挣脱→一次自由落体(流星尾)→落潭溅花
+   ====== 手动调节处：只改下面三个数 ======
+   TEAR_T0    涌起开始的歌曲时刻(s)
+   TEAR_GROW  眼角涌起时长(s)
+   TEAR_SLIDE 挣脱微坠时长(s) — 只在眼角微微下沉 不沿颊滑行(一次掉落)
+   其余全部自动推算：脱离=T0+GROW+SLIDE，
+   落潭=脱离+√(2h/g)，泪蝶诞生/涟漪/预兆退场都跟着走
+============================================================ */
+const TEAR_T0=139.2,TEAR_GROW=1.8,TEAR_SLIDE=.35;
+const TEAR_DET=TEAR_GROW+TEAR_SLIDE;                   // 脱离(相对) 4.3
+const TEAR_DETACH=TEAR_T0+TEAR_DET;                    // 脱离&眨眼全闭 143.5
+const TEAR_FALL=Math.sqrt(2*17.65/9.8);                // 自由落体 ≈1.90s (自眼角落高17.65m)
+const TEAR_HIT=TEAR_DETACH+TEAR_FALL;                  // 落潭 ≈145.21
+const tearU={uTear:{value:-1},uPx:{value:1}};
+{
+ const N=700,dd=new Float32Array(N*4),rr=new Float32Array(N);
+ for(let i=0;i<N;i++){
+  const t=(i+.5)/N,y=1-2*t,r=Math.sqrt(Math.max(1-y*y,0)),a=i*2.399963;
+  dd[i*4]=Math.cos(a)*r;dd[i*4+1]=y;dd[i*4+2]=Math.sin(a)*r;
+  dd[i*4+3]=i<300?0:i<540?1:i<600?3:2; // 0 泪珠 / 1 湿痕 / 3 流星尾 / 2 溅花
+  rr[i]=Math.random();
+ }
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(N*3),3));
+ g.setAttribute('aD',new THREE.BufferAttribute(dd,4));
+ g.setAttribute('aRnd',new THREE.BufferAttribute(rr,1));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,depthTest:false,
+  blending:THREE.AdditiveBlending,uniforms:tearU,
+  vertexShader:`
+  attribute vec4 aD; attribute float aRnd;
+  uniform float uTear,uPx;
+  varying float vA;
+  vec3 slidePath(float s){                 // 挣脱路径（s: 0..1）— 只在眼角微微下沉 随即整颗坠落
+   float se=s*s*(3.-2.*s);
+   return vec3(-2.8+se*.06,17.55-se*.22,-203.6+se*.05);
+  }
+  void main(){
+   float t=uTear,role=aD.w;
+   float hitT=${(TEAR_DET+TEAR_FALL).toFixed(3)};   // 脱离+自由落体(自动推算)
+   vec3 w=vec3(0.,-500.,0.);
+   float szm=1.;
+   vA=0.;
+   if(t>0.&&t<${(TEAR_DET+TEAR_FALL+1.6).toFixed(2)}){
+    if(role<.5){                           // 泪珠本体
+     float grow=clamp(t/${TEAR_GROW.toFixed(2)},0.,1.);
+     float s=clamp((t-${TEAR_GROW.toFixed(2)})/${TEAR_SLIDE.toFixed(2)},0.,1.);
+     vec3 head=slidePath(s);
+     float tf=max(t-${TEAR_DET.toFixed(2)},0.);
+     head.y-=4.9*tf*tf;                    // 真自由落体 y=½gt² (g=9.8, 滑落末速为0从静止落)
+     float r=(.13+.24*grow)*(1.+.12*sin(uTear*9.+aRnd*20.));
+     w=head+aD.xyz*r*(.55+.45*aRnd);
+     vA=grow*1.25*(1.-step(hitT,t));       // 触水即散
+    }else if(role<1.5){                    // 湿痕 — 沿途滞留缓慢蒸发
+     float td=${TEAR_GROW.toFixed(2)}+aRnd*${(TEAR_SLIDE-.05).toFixed(2)};
+     vec3 dep=slidePath(clamp((td-${TEAR_GROW.toFixed(2)})/${TEAR_SLIDE.toFixed(2)},0.,1.));
+     w=dep+aD.xyz*.08;
+     vA=step(td,t)*exp(-(t-td)*.5)*.75;
+    }else if(role<2.5){                    // 落潭溅花
+     float ts2=max(t-hitT,0.);
+     vec3 dir=normalize(vec3(aD.x,abs(aD.y)+.3,aD.z));
+     vec3 imp=vec3(-2.74,-.32,-203.55);    // 落点=眼角正下方潭面
+     w=imp+dir*ts2*(2.+aRnd*3.);
+     w.y-=4.5*ts2*ts2;
+     vA=step(hitT,t)*exp(-ts2*3.2)*1.25;
+    }else{                                 // 流星尾 — 坠落轨迹的余辉
+     float tau=.03+aRnd*.55;               // 各粒回溯不同时长 → 拉出尾巴
+     float t2=t-tau;
+     float tf2=max(t2-${TEAR_DET.toFixed(2)},0.);
+     vec3 h2=slidePath(1.);
+     h2.y-=4.9*tf2*tf2;                    // 尾迹 = 泪珠 tau 秒前的位置
+     w=h2+aD.xyz*(.05+tf2*.10);            // 越靠后越散开
+     vA=step(${TEAR_DET.toFixed(2)},t2)*(1.-step(hitT,t2))  // 只在坠落窗口内
+       *exp(-tau*3.2)*2.0
+       *(.6+.4*sin(uTear*24.+aRnd*40.));   // 流星微闪
+     szm=.9*(1.-tau*.8);
+    }
+   }
+   vec4 mv=viewMatrix*vec4(w,1.);
+   float d=-mv.z;
+   gl_PointSize=clamp((.08+.08*aRnd)*szm*uPx/max(d,.5),1.2,15.);
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;
+  void main(){
+   vec2 q=gl_PointCoord-.5;
+   float dd2=length(q);
+   float m=exp(-dd2*dd2*14.)*smoothstep(.5,.28,dd2);
+   gl_FragColor=vec4(vec3(.85,.97,1.08)*m*vA,1.);   // 玻璃泪色
+  }`});
+ const tp=new THREE.Points(g,m);
+ tp.renderOrder=9;tp.frustumCulled=false;scene.add(tp);
+}
+
+/* ============================================================
+   潭面 — 可见的水池镜面 幽光流转（旋舞的舞台 倒影的居所）
+============================================================ */
+const poolU={uT:{value:0},uAmt:{value:0}};
+{
+ const pg=new THREE.PlaneGeometry(7.4,72,1,1);
+ const pm=new THREE.ShaderMaterial({transparent:true,depthWrite:false,
+  blending:THREE.AdditiveBlending,uniforms:poolU,
+  vertexShader:`varying vec2 vUv;
+  void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+  fragmentShader:`
+  uniform float uT,uAmt;varying vec2 vUv;
+  void main(){
+   vec2 q=vUv-.5;
+   float ex=smoothstep(.5,.30,abs(q.x));                // 池缘柔边
+   float ez=smoothstep(.5,.42,abs(q.y));
+   float rip=.5+.5*sin(vUv.y*160.+uT*1.1+sin(vUv.x*24.+uT*.7)*1.5);
+   rip*=.5+.5*sin(vUv.x*90.-uT*.9+sin(vUv.y*70.+uT*.5));
+   float sheen=.06+.11*rip;
+   vec3 col=vec3(.10,.30,.34)+vec3(.14,.32,.38)*rip;    // 幽潭青
+   gl_FragColor=vec4(col*sheen*uAmt*ex*ez*4.,ex*ez*uAmt*.25);
+  }`});
+ const pmesh=new THREE.Mesh(pg,pm);
+ pmesh.rotation.x=-Math.PI/2;
+ pmesh.position.set(0,-.33,-186);                       // 覆盖旋舞→泪潭一段水域
+ pmesh.renderOrder=2;pmesh.frustumCulled=false;scene.add(pmesh);
+}
+
+/* ============================================================
+   前半叙事伏笔 — 云中之眼(62.1)·红印先兆(76.3)·路上足印
+============================================================ */
+const eyeHintU={uT:{value:0},uA:{value:0},uPx:{value:1}};
+let eyeHintM,eyeHintOn=false;
+{
+ const N=600,pp=new Float32Array(N*3),rr=new Float32Array(N);
+ for(let i=0;i<N;i++){                                 // 独眼 — 若有若无的一瞥
+  const t=Math.random()*6.283,k=Math.random();
+  let x,y;
+  if(k<.6){x=Math.cos(t)*3.4;y=Math.sin(t)*1.35*(1.-.3*Math.abs(Math.cos(t)));} // 杏仁眼睑
+  else if(k<.9){x=Math.cos(t)*1.05;y=Math.sin(t)*1.05;}                          // 虹膜
+  else{const r0=Math.sqrt(Math.random())*.42;x=Math.cos(t)*r0;y=Math.sin(t)*r0;} // 瞳
+  pp[i*3]=x+(Math.random()-.5)*.22;
+  pp[i*3+1]=y+(Math.random()-.5)*.22;
+  pp[i*3+2]=(Math.random()-.5)*.5;
+  rr[i]=Math.random();
+ }
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(pp,3));
+ g.setAttribute('aR',new THREE.BufferAttribute(rr,1));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,depthTest:false,
+  blending:THREE.AdditiveBlending,uniforms:eyeHintU,
+  vertexShader:`
+  attribute float aR;uniform float uT,uA,uPx;varying float vA;
+  void main(){
+   vec4 mv=modelViewMatrix*vec4(position,1.);
+   float tw=.55+.45*sin(uT*(1.2+aR*2.6)+aR*40.);
+   vA=uA*tw;
+   gl_PointSize=min((.5+.5*aR)*uPx/max(-mv.z,1.),8.);
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;
+  void main(){
+   vec2 q=gl_PointCoord-.5;float d=length(q);
+   float m2=exp(-d*d*10.)*smoothstep(.5,.24,d);
+   gl_FragColor=vec4(vec3(.62,.9,1.2)*m2*vA,1.);      // 「所有的思念 变成眼睛」的一瞥
+  }`});
+ eyeHintM=new THREE.Points(g,m);
+ eyeHintM.scale.set(2.2,2.2,1);
+ eyeHintM.renderOrder=8;eyeHintM.frustumCulled=false;eyeHintM.visible=false;
+ scene.add(eyeHintM);
+}
+
+const redHintU={uT:{value:0},uT0:{value:-99},uC:{value:new THREE.Vector3()},uPx:{value:1}};
+{
+ const N=64,pp=new Float32Array(N*3),ar=new Float32Array(N*4);
+ for(let i=0;i<N;i++){
+  ar[i*4]=(Math.random()-.5)*26;ar[i*4+1]=(Math.random()-.5)*18;   // 落点散布
+  ar[i*4+2]=Math.random()*1.6;ar[i*4+3]=26+Math.random()*16;       // 错峰 / 起始高度
+ }
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(pp,3));
+ g.setAttribute('aR',new THREE.BufferAttribute(ar,4));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,depthTest:false,
+  blending:THREE.AdditiveBlending,uniforms:redHintU,
+  vertexShader:`
+  attribute vec4 aR;uniform float uT,uT0,uPx;uniform vec3 uC;varying float vA;
+  void main(){
+   float t=uT-uT0-aR.z;
+   float pr=clamp(t/1.25,0.,1.);
+   vec3 w=uC+vec3(aR.x,aR.w*(1.-pr*pr),aR.y);
+   vA=step(0.,t)*(1.-step(1.25,t))*(.95-.4*pr);
+   vec4 mv=viewMatrix*vec4(w,1.);
+   gl_PointSize=min(.34*uPx/max(-mv.z,1.),16.);
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;
+  void main(){
+   vec2 q=gl_PointCoord-.5;float d=length(q);
+   float m2=exp(-d*d*12.)*smoothstep(.5,.24,d);
+   gl_FragColor=vec4(vec3(1.15,.15,.10)*m2*vA,1.);    // 「烙上红印」— 红雨先至几滴
+  }`});
+ const rm=new THREE.Points(g,m);
+ rm.renderOrder=8;rm.frustumCulled=false;scene.add(rm);
+}
+
+const footU={uT:{value:0},uWash:{value:-1},uPx:{value:1}};
+const FOOTN=48;let footI=0,lastFootZ=1e9,footSide=1;
+const footGeo=new THREE.BufferGeometry();
+footGeo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(FOOTN*3),3));
+footGeo.setAttribute('aB',new THREE.BufferAttribute(new Float32Array(FOOTN).fill(-1e3),1));
+{
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,
+  blending:THREE.AdditiveBlending,uniforms:footU,
+  vertexShader:`
+  attribute float aB;uniform float uT,uWash,uPx;varying float vA;
+  void main(){
+   float age=uT-aB;
+   vA=smoothstep(0.,.5,age)*exp(-age*.16)*.5;
+   if(uWash>0.){float wa=uT-uWash;
+    vA*=(1.+1.8*exp(-wa*2.6))*exp(-wa*1.4);}          // 河水洗足印:先泛光再透明
+   vec4 mv=modelViewMatrix*vec4(position,1.);
+   gl_PointSize=min(.6*uPx/max(-mv.z,1.),26.);
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;
+  void main(){
+   vec2 q=gl_PointCoord-.5;float d=length(q);
+   float m2=exp(-d*d*9.)*smoothstep(.5,.22,d);
+   gl_FragColor=vec4(vec3(.65,.85,.95)*m2*vA,1.);     // 走过的路留微光足迹
+  }`});
+ const fp2=new THREE.Points(footGeo,m);
+ fp2.renderOrder=4;fp2.frustumCulled=false;scene.add(fp2);
+}
+
+/* ============================================================
+   吞入海底 — 「发不出声音 吞入海底」画面沉入深海 气泡缓缓上浮
+============================================================ */
+const bubU={uT:{value:0},uA:{value:0},uPx:{value:1},uCam:{value:new THREE.Vector3()}};
+{
+ const NB2=90,sd=new Float32Array(NB2*3);
+ for(let i=0;i<NB2*3;i++)sd[i]=Math.random();
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(NB2*3),3));
+ g.setAttribute('aS',new THREE.BufferAttribute(sd,3));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,depthTest:false,
+  blending:THREE.AdditiveBlending,uniforms:bubU,
+  vertexShader:`
+  attribute vec3 aS;
+  uniform float uT,uA,uPx;
+  uniform vec3 uCam;
+  varying float vA;
+  void main(){
+   float rise=mod(aS.y*9.+uT*(.5+aS.z*.85),9.);       // 各自的上浮循环
+   vec3 w=uCam+vec3((aS.x-.5)*17.+sin(uT*(.8+aS.y*1.5)+aS.x*40.)*.5,
+     rise-1.5,-2.5-aS.z*16.);
+   vec4 mv=viewMatrix*vec4(w,1.);
+   float d=-mv.z;
+   gl_PointSize=min((.10+.22*aS.y)*uPx/max(d,.5),22.);
+   vA=uA*(.5+.5*sin(uT*2.+aS.x*30.))*smoothstep(0.,1.,rise)*smoothstep(9.,6.5,rise);
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;
+  void main(){
+   vec2 q=gl_PointCoord-.5;float dd=length(q);
+   float ring=smoothstep(.5,.40,dd)*smoothstep(.20,.36,dd);      // 气泡空心壳
+   float hi=exp(-dot(q-vec2(.13,.13),q-vec2(.13,.13))*90.)*.8;   // 一点高光
+   gl_FragColor=vec4(vec3(.62,.85,1.)*(ring*.5+hi)*vA,1.);
+  }`});
+ const o=new THREE.Points(g,m);
+ o.renderOrder=6;o.frustumCulled=false;scene.add(o);
+}
+
+/* ============================================================
+   年轮伏笔 — 「年轮刻下的伏笔 是我们的秘密」
+   路侧树干上年轮光环一圈圈浮现荡开，最内圈隐约是眼形——三重伏笔之一
+============================================================ */
+const ringU={uT:{value:0},uRT:{value:-1},uPx:{value:1}};
+let ringM=null,ringOn=false;
+{
+ const NR2=1100,aR=new Float32Array(NR2*3);
+ for(let i=0;i<NR2;i++){aR[i*3]=Math.random()*6.283;aR[i*3+1]=i%5;aR[i*3+2]=Math.random();}
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(NR2*3),3));
+ g.setAttribute('aR',new THREE.BufferAttribute(aR,3));
+ const m=new THREE.ShaderMaterial({transparent:true,depthWrite:false,
+  blending:THREE.AdditiveBlending,uniforms:ringU,
+  vertexShader:`
+  attribute vec3 aR;
+  uniform float uT,uRT,uPx;
+  varying float vA;varying float vE;
+  void main(){
+   float rt=uRT-aR.y*.5;                              // 五圈相继浮现
+   float eyeK=1.-step(.5,aR.y);                       // 最内圈 = 眼形的秘密
+   float a=aR.x;
+   float rr=(.34+aR.y*.30)*(1.+.045*sin(a*9.+aR.z*30.)+.03*sin(a*17.)); // 年轮的不圆
+   vec2 sh=vec2(cos(a),sin(a)*mix(1.,.40,eyeK));      // 眼: 压扁的轮
+   vec3 p=vec3(sh*rr*(1.+.06*sin(uT*1.7+aR.y*2.)),(aR.z-.5)*.05);
+   vec4 mv=modelViewMatrix*vec4(p,1.);
+   float d=-mv.z;
+   gl_PointSize=min((.06+.05*aR.z)*uPx/max(d,1.),6.);
+   vA=step(0.,rt)*smoothstep(0.,.6,rt)*(1.-smoothstep(2.2,3.4,rt))
+     *(.55+.45*sin(uT*2.6+aR.x*5.+aR.z*20.))*.5;      // 若隐若现 半明半灭
+   vE=eyeK;
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;varying float vE;
+  void main(){
+   vec2 q=gl_PointCoord-.5;float dd=length(q);
+   float m2=exp(-dd*dd*14.)*smoothstep(.5,.3,dd);
+   vec3 col=mix(vec3(1.,.72,.38),vec3(1.,.42,.26),vE); // 木纹金 · 眼轮微红
+   gl_FragColor=vec4(col*m2*vA,1.);
+  }`});
+ ringM=new THREE.Points(g,m);
+ ringM.renderOrder=6;ringM.frustumCulled=false;scene.add(ringM);
+}
+
+const finalButterfly=createFinalButterflyAssets(THREE,scene,{EYE_FULL});
+const {ghostU,ghostObjs,meetRipU}=finalButterfly;
+const {galaxyU,galaxy:galaxyM}=createGalaxyAssets(THREE,sky);  // 终章粒子银河 — 挂在天幕上作背景画布(随镜头)
+{ // 预热：银河 shader 编译+110万顶点上传提前到加载期（uApp=0 画面不可见），免得 159.2s 首现时全场卡死数秒
+ galaxyM.visible=true;
+ renderer.render(scene,camera);
+ galaxyM.visible=false;
+}
+
+/* 歌词光柱 — 全曲逐句同步（秒数按段落估计，可微调）
+   行进段：每句唱到时浮现在视线前方的路侧；终章(fin=1)：悬在幻树之间留底 */
+const LYRICS=[      // 锚点来自酷狗LRC: 7.36/10.94/14.92/37.32/51.44/65.62/150.19
+ [7.36,'夏夜低沉的云雾里 往事更迭一季'],
+ [10.94,'闷不吭声的浮萍 摇曳着欲说还静'],
+ [14.92,'窗帘它揉碎了灯影 揉不灭的心意'],
+ [18.6,'而你微笑沉默如谜 这一刻最难译'],
+ [22.3,'微风悄悄拨弄思绪 山谷窃窃低语'],
+ [26.0,'河水洗掉了足印 回忆都成了透明'],
+ [29.8,'不忍心拆穿的姓名 模糊一段身影'],
+ [33.5,'把往事都埋进竹林 埋掉一切痕迹'],
+ [37.32,'一点一滴淅淅沥沥 一句又一句'],
+ [40.85,'年轮刻下的伏笔 是我们的秘密'],
+ [44.4,'一曲一曲断断续续 是什么结局'],
+ [47.9,'等待传来的回音 留在梦里'],
+ [51.44,'忽而雷声隐隐 如你哭泣'],
+ [55.0,'浸泡时间里 寂寞侵袭'],
+ [58.5,'发不出声音 吞入海底'],
+ [62.1,'所有的思念 变成眼睛'],
+ [65.62,'滴滴答滴滴的雨下起 如你哭泣'],
+ [69.2,'嘲弄我压抑都动了心'],
+ [72.7,'呼啸而来 滚烫的雨滴'],
+ [76.3,'浇打我身体 烙上红印'],
+ [95.7,'夏夜低沉的云雾里 往事更迭一季'],
+ [99.4,'闷不吭声的浮萍 摇曳着欲说还静'],
+ [103.1,'窗帘它揉碎了灯影 揉不灭的心意'],
+ [106.8,'而你微笑沉默如谜 这一刻最难译'],
+ [110.5,'一点一滴淅淅沥沥 一句又一句'],
+ [114.0,'年轮刻下的伏笔 是我们的秘密'],
+ [117.6,'一曲一曲断断续续 是什么结局'],
+ [121.1,'等待传来的回音 留在梦里'],
+ [124.60,'忽而雷声隐隐 如你哭泣',1],
+ [128.25,'浸泡时间里 寂寞侵袭',1],
+ [131.90,'发不出声音 吞入海底',1],
+ [135.55,'所有的思念 变成眼睛',1],
+ [139.20,'滴滴答滴滴的雨下起 如你哭泣',1],
+ [142.85,'嘲弄我压抑都动了心',1],
+ [146.50,'呼啸而来 滚烫的雨滴',1],
+ [150.15,'浇打我身体 烙上红印',1]];
+const LYRIC_MOODS=[   // 依意境取色+成字方式: [关键词, 字面渐变双色, 爆散辉光, 成形方式(见 lyricParticles STYLES)]
+ [/滚烫|烙|红印|浇打/,               ['#ff9a5c','#ff2e14'],'#ff6a30','ember'],   // 灼热·星火升腾灼烙
+ [/雷声|雷|闪/,                      ['#cdb0ff','#7a3bff'],'#a97fff','thunder'], // 雷电紫·电弧劈落
+ [/思念|心意|心|秘密|梦|回音/,        ['#ff9ed2','#c74ed6'],'#ff7fd0','firefly'], // 思念粉·萤火盘旋
+ [/哭泣|泪|眼睛/,                    ['#9cc8ff','#2f6bff'],'#5f9bff','rain'],    // 泪蓝·雨滴坠落
+ [/海底|吞|浸泡|寂寞|压抑|沉默/,      ['#7d9bd8','#22357f'],'#4a66c0','water'],   // 深海郁蓝·水中浮起
+ [/雨|淅沥|滴/,                      ['#8fc3ff','#2f7bff'],'#57a0ff','rain'],    // 冷雨·雨滴坠落
+ [/微风|山谷|低语|摇曳/,             ['#b9e6c6','#5fbf8f'],'#8fdfb5','wind'],    // 风·叶絮乘风掠入
+ [/云雾|浮萍|竹林|河水|灯影|夏夜|透明/,['#a5eec8','#2fbf7f'],'#5fdfa5','mist']];  // 雾竹绿·雾气凝形
+const moodOf=line=>{
+ for(const[re,g,a,st]of LYRIC_MOODS)if(re.test(line))return{colors:g,accent:a,style:st};
+ return{colors:['#aecdff','#6f92e8'],accent:'#8fb4ff',style:'firefly'};};
+const lyricItems=[];
+{
+ const PX=[-20,20,-34,34,-22,22,-36,36],PZ=[-192,-192,-212,-212,-196,-196,-218,-218]; // 巨蝶两侧对称悬挂
+ let fi=0,prevLyricPts=null;
+ LYRICS.forEach(([t0,line,fin],i)=>{
+  const built=createLyricParticleLine(THREE,{line,fin:!!fin,prevPoints:prevLyricPts,density:1,
+   ...(fin?{colors:['#bdd7ff','#bdd7ff'],accent:'#d6e6ff',           // 终章统一淡蓝白
+            special:{chars:'红印',color:'#ff1c08'},                  // 唯"红印"二字灼红
+            style:moodOf(line).style}                                // 成形方式仍随句意
+         :moodOf(line))});
+  prevLyricPts=built.points;
+  const {mesh,u,H}=built;
+  if(fin){
+   mesh.position.set(PX[fi%8],H/2+7+(fi%3)*3,PZ[fi%8]);
+   mesh.rotation.y=(mesh.position.x>0?-1:1)*.16;
+   fi++;
+  }else mesh.position.set(0,-200,0);               // 唱到时再放到前方
+  const next=LYRICS[i+1];
+  lyricItems.push({u,t0,fin:!!fin,mesh,H,placed:false,
+   nxt:next?next[0]:1e9,
+   dur:fin?0:Math.max((next?next[0]:t0+5)-t0,3.2)});
+  scene.add(mesh);
+ });
+}
+
+/* ============================================================
+   叮 · 漫天巨雷 — on every chime, a sky-wide particle mega
+   lightning storm crashes down ahead 一声叮，满天雷落
+============================================================ */
+const dingU={uT:{value:0},uT0:{value:-9},uPx:{value:1},uAmp:{value:1}};
+const DBMAX=16000;
+const dingGeo=new THREE.BufferGeometry();
+dingGeo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(DBMAX*3),3));
+dingGeo.setAttribute('aR',new THREE.BufferAttribute(new Float32Array(DBMAX*2),2));
+dingGeo.setAttribute('aH',new THREE.BufferAttribute(new Float32Array(DBMAX),1));
+dingGeo.setDrawRange(0,0);
+{
+ const mk=core=>new THREE.ShaderMaterial({transparent:true,depthWrite:false,
+  depthTest:false,                             // 雷穿透竹林山峦，永远可见
+  blending:THREE.AdditiveBlending,uniforms:dingU,
+  vertexShader:`
+  attribute vec2 aR; attribute float aH;
+  uniform float uT,uT0,uPx,uAmp;
+  varying float vA;
+  void main(){
+   float age=max(uT-uT0,0.);
+   float prog=clamp(age/.13,0.,1.);           // strikes shoot downward 自天而降
+   float vis=step(aH,prog);
+   vec4 mv=viewMatrix*vec4(position,1.);
+   float d=-mv.z;
+   float w=aR.y;
+   gl_PointSize=min(${core?'(.14+.30*w)':'(1.4+3.0*w)'}*(.75+.25*uAmp)*uPx/max(d,1.),${core?'34.':'140.'});
+   float fl=.55+.45*sin(uT*130.+aR.x*40.);
+   float envA=exp(-max(age-.04,0.)*3.4)+.65*exp(-abs(age-.26)*20.);  // 主击+回击
+   vA=vis*fl*envA*uAmp*${core?'(2.4*w)':'(.10*w)'}*step(age,1.5);
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;
+  void main(){
+   vec2 q=gl_PointCoord-.5;
+   float dd=length(q);
+   float m=exp(-dd*dd*${core?'10.':'7.'})*smoothstep(.5,.26,dd);
+   gl_FragColor=vec4(vec3(${core?'1.2,1.12,1.4':'.72,.5,1.2'})*m*vA,1.);  // 白紫巨雷
+  }`});
+ for(const core of[false,true]){
+  const dm=new THREE.Points(dingGeo,mk(core));
+  dm.renderOrder=8;
+  dm.frustumCulled=false;scene.add(dm);
+ }
+}
+function spawnDingStorm(cx0,cz0,mega,far,fx=0,fz=-1){
+ const pos=dingGeo.attributes.position.array,ar=dingGeo.attributes.aR.array,
+       ah=dingGeo.attributes.aH.array;
+ let n=0;
+ const put=(x,y,z,w,h)=>{if(n<DBMAX){pos[n*3]=x;pos[n*3+1]=y;pos[n*3+2]=z;
+  ar[n*2]=Math.random();ar[n*2+1]=w;ah[n]=h;n++;}};
+ function channel(x1,y1,z1,x2,y2,z2,w,gen,ty){
+  let vs=[[x1,y1,z1],[x2,y2,z2]];
+  for(let it=0;it<6;it++){
+   const nv=[vs[0]];
+   for(let i=1;i<vs.length;i++){
+    const a=vs[i-1],b=vs[i];
+    const len=Math.hypot(b[0]-a[0],b[1]-a[1],b[2]-a[2]),dsp=len*.22;
+    nv.push([(a[0]+b[0])/2+(Math.random()-.5)*dsp,
+             (a[1]+b[1])/2+(Math.random()-.5)*dsp*.45,
+             (a[2]+b[2])/2+(Math.random()-.5)*dsp],b);
+   }
+   vs=nv;
+  }
+  for(let i=1;i<vs.length;i++){
+   const a=vs[i-1],b=vs[i];
+   const len=Math.hypot(b[0]-a[0],b[1]-a[1],b[2]-a[2]);
+   const m2=Math.max(Math.ceil(len/.25),1);
+   for(let k=0;k<m2;k++){const t=k/m2;
+    const y=a[1]+(b[1]-a[1])*t;
+    put(a[0]+(b[0]-a[0])*t,y,a[2]+(b[2]-a[2])*t,w,Math.min(Math.max((ty-y)/ty,0),1));}
+   if(gen<2&&i<vs.length*.75&&Math.random()<.05){
+    const bl=(a[1]-y2)*(.25+Math.random()*.35);
+    if(bl>3)channel(a[0],a[1],a[2],
+     a[0]+(Math.random()-.5)*bl*1.3,a[1]-bl,a[2]+(Math.random()-.5)*bl*1.3,w*.42,gen+1,ty);
+   }
+  }
+ }
+ const NCH=mega?15+Math.floor(Math.random()*4)  // 巨雷：漫天 15-18 道齐落
+              :3+Math.floor(Math.random()*2);  // 普通叮：3-4 道近雷
+ for(let c=0;c<NCH;c++){
+  const side=c%2?-1:1;                          // 左右交替 — 两边同时劈下
+  const dist=far?(Math.random()-.5)*36          // 远雷：绕视线落点成簇
+            :28+Math.random()*(mega?60:45);     // 近雷：28-88m，雾里也清晰
+  let lat=side*(far?9+Math.random()*27:mega?8+Math.random()*80:5+Math.random()*36);
+  if(!far)lat=Math.sign(lat)*Math.min(Math.abs(lat),dist*(mega?.85:.55)); // 收进视锥
+  const bx=cx0+fx*dist-fz*lat;                  // 沿实际视线方向展开
+  const bz=cz0+fz*dist+fx*lat;
+  const ty=(far?84:mega?68:54)+Math.random()*(mega?26:14);
+  const ex=bx+(Math.random()-.5)*24,ez=bz+(Math.random()-.5)*14;
+  const ey=Math.max(groundH(ex,ez),-.35);
+  channel(bx,ty,bz,ex,ey,ez,1,0,ty);
+  for(let i=0;i<20;i++){                        // 落点炸开
+   const a=Math.random()*6.283,r=Math.sqrt(Math.random())*1.8;
+   put(ex+Math.cos(a)*r,ey+Math.random()*.8,ez+Math.sin(a)*r,1.1,1);
+  }
+ }
+ dingGeo.setDrawRange(0,n);
+ dingGeo.attributes.position.needsUpdate=true;
+ dingGeo.attributes.aR.needsUpdate=true;
+ dingGeo.attributes.aH.needsUpdate=true;
+ return{x:far?cx0:cx0+fx*70,z:far?cz0:cz0+fz*70};   // 闪光灯跟着视线方向的雷群中心
+}
+
+/* ============================================================
+   闪电 lightning bolts — jagged glowing channels ahead in view
+============================================================ */
+const boltU={uA:{value:0},uT:{value:0},uPx:{value:1}};
+const BOLT_MAX=6000;
+const boltGeo=new THREE.BufferGeometry();
+boltGeo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(BOLT_MAX*3),3));
+boltGeo.setAttribute('aR',new THREE.BufferAttribute(new Float32Array(BOLT_MAX*2),2)); // [rand, width]
+boltGeo.setDrawRange(0,0);
+{ // two passes over the same channel: hot white core + wide blue halo
+ const mk=core=>new THREE.ShaderMaterial({transparent:true,depthWrite:false,
+  depthTest:false,                             // 风暴闪电同样穿透景物
+  blending:THREE.AdditiveBlending,uniforms:boltU,
+  vertexShader:`
+  attribute vec2 aR;
+  uniform float uA,uT,uPx;
+  varying float vA;
+  void main(){
+   vec4 mv=viewMatrix*vec4(position,1.);
+   float d=-mv.z;
+   float w=aR.y;
+   gl_PointSize=min(${core?'(.10+.22*w)':'(1.0+2.4*w)'}*uPx/max(d,1.),${core?'14.':'90.'});
+   float fl=.6+.4*sin(uT*120.+aR.x*40.);
+   vA=uA*fl*${core?'(2.2*w)':'(.09*w)'};
+   gl_Position=projectionMatrix*mv;
+  }`,
+  fragmentShader:`
+  varying float vA;
+  void main(){
+   vec2 q=gl_PointCoord-.5;
+   float dd=length(q);
+   float m=exp(-dd*dd*${core?'10.':'7.'})*smoothstep(.5,.25,dd);
+   gl_FragColor=vec4(vec3(${core?'1.22,1.05,1.38':'.62,.42,1.18'})*m*vA,1.);  // violet storm 紫电
+  }`});
+ for(const core of[false,true]){
+  const bm=new THREE.Points(boltGeo,mk(core));
+  bm.renderOrder=8;
+  bm.frustumCulled=false;scene.add(bm);
+ }
+}
+function spawnBolt(cx0,cz0,fx=0,fz=-1){
+ const pos=boltGeo.attributes.position.array,ar=boltGeo.attributes.aR.array;
+ let n=0;
+ const put=(x,y,z,w)=>{if(n<BOLT_MAX){pos[n*3]=x;pos[n*3+1]=y;pos[n*3+2]=z;
+  ar[n*2]=Math.random();ar[n*2+1]=w;n++;}};
+ function channel(x1,y1,z1,x2,y2,z2,w,gen){
+  let vs=[[x1,y1,z1],[x2,y2,z2]];
+  for(let it=0;it<6;it++){                       // fractal midpoint displacement 分形曲折
+   const nv=[vs[0]];
+   for(let i=1;i<vs.length;i++){
+    const a=vs[i-1],b=vs[i];
+    const len=Math.hypot(b[0]-a[0],b[1]-a[1],b[2]-a[2]),dsp=len*.22;
+    nv.push([(a[0]+b[0])/2+(Math.random()-.5)*dsp,
+             (a[1]+b[1])/2+(Math.random()-.5)*dsp*.45,
+             (a[2]+b[2])/2+(Math.random()-.5)*dsp],b);
+   }
+   vs=nv;
+  }
+  for(let i=1;i<vs.length;i++){
+   const a=vs[i-1],b=vs[i];
+   const len=Math.hypot(b[0]-a[0],b[1]-a[1],b[2]-a[2]);
+   const m2=Math.max(Math.ceil(len/.25),1);
+   for(let k=0;k<m2;k++){const t=k/m2;
+    put(a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t,w);}
+   if(gen<2&&i<vs.length*.75&&Math.random()<.05){ // side leaders 分叉
+    const bl=(a[1]-y2)*(.25+Math.random()*.35);
+    if(bl>3)channel(a[0],a[1],a[2],
+     a[0]+(Math.random()-.5)*bl*1.3,a[1]-bl,a[2]+(Math.random()-.5)*bl*1.3,w*.42,gen+1);
+   }
+  }
+ }
+ const dist=55+Math.random()*45;
+ const lat=(Math.random()-.5)*2*dist*.40;        // 横向收在±22°视锥内
+ const bx=cx0+fx*dist-fz*lat;
+ const bz=cz0+fz*dist+fx*lat;                    // 沿实际视线落雷 运镜转向也看得见
+ const ex=bx+(Math.random()-.5)*20,ez=bz+(Math.random()-.5)*12;
+ const ey=Math.max(groundH(ex,ez),-.35);
+ channel(bx,58+Math.random()*14,bz,ex,ey,ez,1,0);
+ for(let i=0;i<26;i++){                          // ground flash 落地亮斑
+  const a=Math.random()*6.283,r=Math.sqrt(Math.random())*1.6;
+  put(ex+Math.cos(a)*r,ey+Math.random()*.7,ez+Math.sin(a)*r,1.1);
+ }
+ boltGeo.setDrawRange(0,n);
+ boltGeo.attributes.position.needsUpdate=true;
+ boltGeo.attributes.aR.needsUpdate=true;
+ return{x:bx,z:bz};
+}
+
+/* ============================================================
+   GPGPU 核心 — ping-pong FBO 百万粒子管线（?gpu 开启）
+   pos/vel 驻留 Float32 纹理显存；阻尼积分 v'=v·e^(-cΔt)+FΔt
+   力场 = SDF目标弹簧 + 4D simplex + curl偏导场 + 30种矢量场
+============================================================ */
+const GPUQ=new URLSearchParams(location.search);
+const GPU={on:!GPUQ.has('nogpu'),ok:false,f1:0,f2:1}; // 默认启用（5070Ti 级），?nogpu 回退
+
+
+
+if(GPU.on){
+ try{
+  const SIM=Math.max(256,Math.min(parseInt(GPUQ.get('gpu'))||1024,2048));
+  const N2=SIM*SIM;
+  const mkSim=()=>new THREE.WebGLRenderTarget(SIM,SIM,{minFilter:THREE.NearestFilter,
+   magFilter:THREE.NearestFilter,type:THREE.FloatType,depthBuffer:false});
+  const posA=mkSim(),posB=mkSim(),velA=mkSim(),velB=mkSim();
+  const simCam=new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+  const quad=new THREE.PlaneGeometry(2,2);
+  const mkP=(frag,uni)=>{const sc=new THREE.Scene();
+   sc.add(new THREE.Mesh(quad,new THREE.ShaderMaterial({uniforms:uni,
+    depthTest:false,depthWrite:false,
+    vertexShader:'varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.,1.);}',
+    fragmentShader:frag})));return sc;};
+  const HASH='float hsh(float n){return fract(sin(n)*43758.5453);}';
+  // 目标场：完整 12 层解剖巨眼（与渲染端同源函数）或 .ply 点云
+  const TGT=EYE_FULL;
+  GPU.u={tPos:{value:null},tVel:{value:null},tPly:{value:null},
+   uDt:{value:.016},uT:{value:0},uGrow:{value:0},uDrop:{value:0},
+   uBeat:{value:0},uBoltG:{value:0},uF1:{value:0},uF2:{value:1},
+   uFMix:{value:0},uUsePly:{value:0},uInit:{value:1},
+   uDevR:{value:0},uDevC:{value:new THREE.Vector2(0,-7.4)},
+   uDevC2:{value:new THREE.Vector2(0,-7.4)},uBurst:{value:0},uReform:{value:0},uTb:{value:0},
+   uAsc:{value:0},                                   // 双星入河: 两只领头蝶攀向星河
+   uCtr:{value:new THREE.Vector3(0,22,-205)}};
+  const COMMON=HASH+GLSL_SIM_NOISE+TGT+BFLY_PT+TORNADO_PT+`
+  uniform sampler2D tPos,tVel,tPly;
+  uniform float uDt,uT,uGrow,uDrop,uBeat,uBoltG,uF1,uF2,uFMix,uUsePly,uInit,uDevR,uBurst,uReform,uTb,uAsc;
+  uniform vec2 uDevC,uDevC2;
+  uniform vec3 uCtr;
+  varying vec2 vUv;
+  void meta(out float n1,out float n2,out float seed,out float h,out float e){
+   n1=hsh(dot(vUv,vec2(127.1,311.7)));
+   n2=hsh(dot(vUv,vec2(269.5,183.3)));
+   seed=hsh(dot(vUv,vec2(419.2,371.9)));
+   h=fract(n1*5.17)*.8;
+   float p=clamp((uGrow-h*.55-n1*.10)*2.8,0.,1.);
+   e=p*p*(3.-2.*p);
+  }
+  vec3 target(float n1,float n2,float seed,out float dv){
+   vec3 ec;float sf,ir2,ea;
+   vec3 ep=eyeFull(n1,n2,seed,uT,uTb,uBeat,uBoltG,ec,sf,ir2,ea);
+   if(uUsePly>.5)ep=texture2D(tPly,vec2(n1,n2)).xyz;
+   vec3 t=uCtr+ep;
+   // 双蝶感染 → 感染波从两只蝴蝶各自荡开，粒子被卷入龙卷风漩涡
+   float dInf=min(length(ep.xy-uDevC),length(ep.xy-uDevC2))+(fract(n1*777.7)-.5)*2.4;
+   float uu2=clamp((uDevR-dInf)/2.8,0.,1.)*step(1e-4,uDevR);
+   dv=uu2*uu2*(3.-2.*uu2);                          // 感染系数（0→1）
+   if(dv>0.){
+    float age=max((uDevR-dInf)/5.,0.);              // 感染后经过的秒数（uDevR 以 5/s 增长）
+    vec3 tor=uCtr+tornadoPt(n1,n2,seed,ep,age,uT);
+    float bk,bnd;vec3 bp=uCtr+bflyPt(n1,n2,seed,uT,bk,bnd);
+    float rfm=smoothstep(.32+fract(seed*53.9)*.22,1.,uReform); // 散落后错峰缓聚 免同时挤成一团
+    rfm=rfm*rfm*(3.-2.*rfm);
+    vec3 tp=mix(tor,bp,rfm);                        // 散落星火→缓缓合为蝴蝶（粒子数不变）
+    float bfk2=floor(fract(n1*57.77)*180.);         // 与 bflyPt 同一归属哈希
+    float duo=(1.-step(1.5,bfk2))*rfm;              // 头两只 = 青蝶×泪蝶的化身
+    float ascE=uAsc*uAsc*(3.-2.*uAsc);
+    vec3 up=uCtr+vec3((bfk2*2.-1.)*7.,165.,-135.);  // 双星入河: 攀向天幕银河的方向
+    up.x+=sin(uAsc*9.+bfk2*3.)*3.*(1.-ascE);        // 途中微螺旋(渐远自然隐去 星辰接棒)
+    tp=mix(tp,up,duo*ascE);
+    t=mix(t,tp,dv);
+   }
+   return t;
+  }`;
+  GPU.velP=mkP(COMMON+`
+  void main(){
+   float n1,n2,seed,h,e;meta(n1,n2,seed,h,e);
+   vec3 pos=texture2D(tPos,vUv).xyz;
+   vec3 vel=texture2D(tVel,vUv).xyz;
+   if(uInit>.5){gl_FragColor=vec4(0.);return;}
+   float dv;vec3 tgt=target(n1,n2,seed,dv);
+   vec3 F=(tgt-pos)*mix(.5,16.,e);          // SDF 目标弹簧
+   float amb=1.-e;
+   F+=curlN(pos*.11,uT*.25)*amb*24.;        // curl 偏导场
+   F+=vec3(snoise4(vec4(pos*.05,uT*.2)),snoise4(vec4(pos*.05+31.,uT*.2)),
+     snoise4(vec4(pos*.05+57.,uT*.2)))*amb*7.;  // 4D simplex 漂移
+   F+=vfBlend(pos-uCtr,uT,uF1,uF2,uFMix)*amb*9.;// 段落调度矢量场
+   F+=vec3(0.,-5.,0.)*amb*step(e,.02);      // 未成形前的雨滴重力
+   float kb=dv*(1.-dv)*4.;                  // 感染卷入途中：松开弹簧，卷成飞旋
+   F*=1.-.72*kb;
+   F+=curlN(pos*.14+7.,uT*.5)*kb*30.;
+   float rfm2=smoothstep(.32,1.,uReform);
+   float sc2=smoothstep(0.,.25,uReform)*(1.-rfm2); // 散开窗口: 爆散后悬漂 尚未聚拢
+   if(uBurst>0.||sc2>0.){                   // 炸开 — 感染满后向四方散落
+    float bg=min(uBurst*2.5,1.);
+    vec3 dir=normalize(pos-uCtr+vec3(1e-4,1e-4,0.));
+    F=F*(1.-.85*max(bg,sc2))                // 散开期弹簧近乎松开
+     +dir*bg*110.                           // 爆散冲量 四方远扬
+     +curlN(pos*.07+3.,uT*.4)*max(bg,sc2)*24. // 湍流漂散
+     +vec3(0.,bg*6.,0.);                    // 升腾余烬
+   }
+   F*=mix(1.,.10+.55*rfm2*rfm2,dv*step(1e-3,uReform)); // 归蝶弹簧由极松渐紧 缓缓合拢
+   float c=mix(1.8,7.,e);                   // 自适应阻尼
+   vec3 v2=vel*exp(-c*uDt)+F*uDt;           // 阻尼积分方程
+   float sp=length(v2);if(sp>60.)v2*=60./sp;
+   gl_FragColor=vec4(v2,1.);
+  }`,GPU.u);
+  GPU.posP=mkP(COMMON+`
+  void main(){
+   float n1,n2,seed,h,e;meta(n1,n2,seed,h,e);
+   if(uInit>.5){                            // 初始化：雨滴自天而布
+    gl_FragColor=vec4(uCtr.x+(n1-.5)*90.,n2*45.,
+      uCtr.z+(hsh(n1*91.+n2*57.)-.5)*60.,0.);return;}
+   vec3 pos=texture2D(tPos,vUv).xyz;
+   vec3 vel=texture2D(tVel,vUv).xyz;
+   pos+=vel*uDt;
+   if(e<.05&&pos.y<-.4)pos.y+=46.;          // 雨滴循环
+   gl_FragColor=vec4(pos,e);
+  }`,GPU.u);
+  // 渲染：从显存纹理取位，两遍（本体+潭中倒影）
+  GPU.ru={tPos:{value:null},uPx:{value:1},uT:{value:0},uDrop:{value:0},
+   uGrow:{value:0},uBeat:{value:0},uBoltG:{value:0},
+   uDevR:{value:0},uDevC:{value:new THREE.Vector2(0,-7.4)},
+   uDevC2:{value:new THREE.Vector2(0,-7.4)},uBurst:{value:0},uReform:{value:0},uTb:{value:0},
+   uMirA:{value:1},
+   uCnt:{value:Math.min(1,34000/N2*2.6)}}; // 严格线性能量守恒（×2.6 小点补偿）
+  const rg=new THREE.BufferGeometry();
+  {const pa=new Float32Array(N2*3);
+   for(let i=0;i<N2;i++){pa[i*3]=(i%SIM+.5)/SIM;pa[i*3+1]=(Math.floor(i/SIM)+.5)/SIM;}
+   rg.setAttribute('position',new THREE.BufferAttribute(pa,3));}
+  const mkR=mirror=>new THREE.ShaderMaterial({transparent:true,depthWrite:false,
+   depthTest:false,blending:THREE.AdditiveBlending,uniforms:GPU.ru,
+   vertexShader:HASH+EYE_FULL+BFLY_PT+`
+   uniform sampler2D tPos;
+   uniform float uPx,uT,uDrop,uGrow,uBeat,uBoltG,uCnt,uDevR,uBurst,uReform,uTb,uMirA;
+   uniform vec2 uDevC,uDevC2;
+   varying float vA;varying float vE;varying vec3 vC;varying float vFl;
+   void main(){
+    vec2 uv=position.xy;
+    vec4 pp=texture2D(tPos,uv);
+    vec3 w=pp.xyz;float e=pp.w;
+    `+(mirror?'w.y=-.70-w.y;w.x+=sin(uT*2.4+w.z*1.7)*.10;':'')+`
+    vec4 mv=viewMatrix*vec4(w,1.);
+    float d=-mv.z;
+    float n1=hsh(dot(uv,vec2(127.1,311.7)));
+    float n2=hsh(dot(uv,vec2(269.5,183.3)));
+    float seed=hsh(dot(uv,vec2(419.2,371.9)));
+    vec3 ec;float sf,ir2,ea;
+    vec3 epl=eyeFull(n1,n2,seed,uT,uTb,uBeat,uBoltG,ec,sf,ir2,ea);   // 完整解剖配色/尺寸/睑遮
+    // 双蝶感染波 — 与 sim 端同源的传递进度（从两只蝴蝶各自荡开）
+    float dInf=min(length(epl.xy-uDevC),length(epl.xy-uDevC2))+(fract(n1*777.7)-.5)*2.4;
+    float uu2=clamp((uDevR-dInf)/2.8,0.,1.)*step(1e-4,uDevR);
+    float inf=smoothstep(.0,.5,uu2);                             // 感染系数（0→1）
+    float age=max((uDevR-dInf)/5.,0.);                          // 感染后经过的秒数
+    float flare=exp(-abs(uDevR-dInf)*.9)*step(1e-4,uDevR);      // 感染波前白热
+    vec3 vortexCol=mix(vec3(.95,.28,.14),vec3(1.15,.62,.32),     // 深红 → 炽金（降亮防过曝）
+      .5+.5*sin(age*3.+seed*6.));
+    float h=fract(n1*5.17)*.8;
+    float flow=pow(.5+.5*sin(h*14.-uT*2.4+seed*6.),3.);  // 灵动流光
+    float tw=.72+.28*sin(uT*(1.2+seed*3.)+h*30.);
+    float rfm=smoothstep(.32,1.,uReform);               // 聚拢进度(与 sim 端同步)
+    float sz=(.14+.16*fract(n1*77.))*mix(1.,mix(sf,1.,max(inf,rfm)),e)*(1.+ir2*.7*(1.-inf));
+    sz*=1.+flare*.8+uBurst*.35;                         // 爆散时略放大成火花
+    gl_PointSize=clamp(sz*uPx/max(d,1.),1.2,10.);
+    float grain=mix(.35,1.15,step(.42,fract(n1*777.7))); // 点彩明暗抖动
+    vA=mix(.30*uDrop,.55*tw*(.75+.85*flow)*mix(ea,.8,max(inf,rfm)),e)*grain*uCnt;
+    vA+=e*(1.-e)*.5*uCnt;                                // 缠绕途中发亮
+    vA*=.6;                                              // 能量基准（分区增益在 eyeFull 内按面密度配平）
+    vA*=1.+inf*.22*(1.-rfm);                             // 漩涡微亮，不过曝；复蝶后回落
+    vA*=mix(1.,.6,rfm);                                  // 化蝶后压暗防过曝
+    vA+=flare*e*.4*uCnt;
+    vA*=smoothstep(220.,60.,d)`+(mirror?'*smoothstep(5.4,4.5,abs(w.x))*.35*uMirA':'')+`;
+    vec3 pc=mix(ec,vortexCol,inf);
+    pc=mix(pc,vec3(1.35,1.18,1.02),min(uBurst,1.)*.55);  // 闪光 → 收敛白
+    vC=mix(pc,ec,rfm);                                   // 化蝶后回到眼睛配色
+    vE=e;vFl=min(flare,1.)*e;
+    gl_Position=projectionMatrix*mv;
+   }`,
+   fragmentShader:`
+   varying float vA;varying float vE;varying vec3 vC;varying float vFl;
+   void main(){
+    vec2 q=gl_PointCoord-.5;float dd=length(q);
+    float m=exp(-dd*dd*20.)*smoothstep(.44,.26,dd);
+    vec3 col=mix(vec3(1.,.16,.10),vC,vE);               // 红雨滴→解剖部位色
+    col=mix(col,vec3(1.4,1.15,.95),vFl*.85);            // 吞灭波前白热
+    gl_FragColor=vec4(col*m*vA,1.);
+   }`});
+  GPU.objs=[];
+  for(const mirror of[false,true]){
+   const o=new THREE.Points(rg,mkR(mirror));
+   o.renderOrder=mirror?7:8;o.frustumCulled=false;o.visible=false;scene.add(o);
+  GPU.objs.push(o);}
+  GPU.rt={posA,posB,velA,velB};GPU.cam=simCam;GPU.ok=true;
+ }catch(err){console.warn('GPGPU init failed, fallback to legacy:',err);GPU.ok=false;}
+}
+// .ply 数据管线：解析 + BoundingBox 自适应归一化 → 目标纹理
+{
+ const plyURL=new URLSearchParams(location.search).get('ply');
+ if(plyURL&&GPU.ok)fetch(plyURL).then(r=>r.arrayBuffer()).then(buf=>{
+  const head=new TextDecoder().decode(buf.slice(0,4096));
+  const hEnd=head.indexOf('end_header')+11;
+  const lines=head.slice(0,hEnd).split('\n');
+  let n=0,bin=false,props=0,xi=0;
+  for(const L of lines){
+   if(L.startsWith('format binary_little_endian'))bin=true;
+   if(L.startsWith('element vertex'))n=parseInt(L.split(' ')[2]);
+   if(L.startsWith('property')){if(L.trim().endsWith(' x'))xi=props;props++;}
+  }
+  const pts=new Float32Array(n*3);
+  if(bin){const dv=new DataView(buf,hEnd);
+   for(let i=0;i<n;i++)for(let k=0;k<3;k++)
+    pts[i*3+k]=dv.getFloat32((i*props+xi+k)*4,true);
+  }else{const txt=new TextDecoder().decode(buf.slice(hEnd)).trim().split('\n');
+   for(let i=0;i<n;i++){const c=txt[i].trim().split(/\s+/);
+    for(let k=0;k<3;k++)pts[i*3+k]=parseFloat(c[xi+k]);}}
+  let mn=[1e9,1e9,1e9],mx=[-1e9,-1e9,-1e9];
+  for(let i=0;i<n;i++)for(let k=0;k<3;k++){
+   mn[k]=Math.min(mn[k],pts[i*3+k]);mx[k]=Math.max(mx[k],pts[i*3+k]);}
+  const scl=26/Math.max(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2]);  // bbox 归一化到巨眼尺度
+  const T=256,tex=new Float32Array(T*T*4);
+  for(let i=0;i<T*T;i++){const j=Math.floor(Math.random()*n);
+   for(let k=0;k<3;k++)tex[i*4+k]=(pts[j*3+k]-(mn[k]+mx[k])/2)*scl;}
+  const dt2=new THREE.DataTexture(tex,T,T,THREE.RGBAFormat,THREE.FloatType);
+  dt2.needsUpdate=true;
+  GPU.u.tPly.value=dt2;GPU.u.uUsePly.value=1;
+ }).catch(e=>console.warn('ply load failed',e));
+}
+
+/* ============================================================
+   post — bloom + vignette 辉光后处理（加 ?nobloom 可关闭）
+============================================================ */
+const NOBLOOM=new URLSearchParams(location.search).has('nobloom');
+const DPR=Math.min(devicePixelRatio,2);
+const post={};
+{
+ const mkRT=(w,h)=>new THREE.WebGLRenderTarget(w,h,
+  {minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter});
+ post.rtS=mkRT(innerWidth*DPR,innerHeight*DPR);
+ post.rtA=mkRT(innerWidth*DPR>>1,innerHeight*DPR>>1);
+ post.rtB=mkRT(innerWidth*DPR>>1,innerHeight*DPR>>1);
+ post.rtC=mkRT(innerWidth*DPR>>2,innerHeight*DPR>>2);  // 四分之一分辨率 — 大尺度弥散辉光
+ post.rtD=mkRT(innerWidth*DPR>>2,innerHeight*DPR>>2);
+ post.rtH1=mkRT(innerWidth*DPR,innerHeight*DPR);       // 历史帧 ping-pong — 残影
+ post.rtH2=mkRT(innerWidth*DPR,innerHeight*DPR);
+ post.flip=false;
+ post.cam=new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+ const geo=new THREE.PlaneGeometry(2,2);
+ const mkPass=(frag,uni)=>{
+  const sc=new THREE.Scene();
+  sc.add(new THREE.Mesh(geo,new THREE.ShaderMaterial({uniforms:uni,
+   depthWrite:false,depthTest:false,
+   vertexShader:`varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.,1.);}`,
+   fragmentShader:frag})));
+  return sc;
+ };
+ post.uA={tNew:{value:null},tOld:{value:null},uDamp:{value:.9}};
+ post.after=mkPass(`
+  uniform sampler2D tNew,tOld;uniform float uDamp;varying vec2 vUv;
+  void main(){
+   vec3 n=texture2D(tNew,vUv).rgb;
+   vec3 o=texture2D(tOld,vUv).rgb*uDamp;
+   gl_FragColor=vec4(max(n,o),1.);                  // 历史帧反馈残影 不叠加过曝
+  }`,post.uA);
+ post.uB={tD:{value:null}};
+ post.bright=mkPass(`
+  uniform sampler2D tD;varying vec2 vUv;
+  void main(){
+   vec3 c=texture2D(tD,vUv).rgb;
+   float l=dot(c,vec3(.299,.587,.114));
+   gl_FragColor=vec4(c*smoothstep(.48,.9,l),1.);
+  }`,post.uB);
+ post.uBl={tD:{value:null},uDir:{value:new THREE.Vector2(1,0)},
+  uRes:{value:new THREE.Vector2(1,1)}};
+ post.blur=mkPass(`
+  uniform sampler2D tD;uniform vec2 uDir,uRes;varying vec2 vUv;
+  void main(){
+   vec2 o=uDir/uRes;
+   vec3 s=texture2D(tD,vUv).rgb*.227;
+   s+=(texture2D(tD,vUv+o*1.384).rgb+texture2D(tD,vUv-o*1.384).rgb)*.316;
+   s+=(texture2D(tD,vUv+o*3.230).rgb+texture2D(tD,vUv-o*3.230).rgb)*.070;
+   gl_FragColor=vec4(s,1.);
+  }`,post.uBl);
+ post.uF={tD:{value:null},tB:{value:null},tB2:{value:null}};
+ post.fin=mkPass(`
+  uniform sampler2D tD,tB,tB2;varying vec2 vUv;
+  void main(){
+   vec3 c=texture2D(tD,vUv).rgb
+     +texture2D(tB,vUv).rgb*.85                     // 半分辨率 — 锐利辉光
+     +texture2D(tB2,vUv).rgb*.8;                    // 1/4分辨率 — 大尺度弥散(类Unreal多级)
+   float r=length((vUv-.5)*vec2(1.25,1.));
+   c*=1.-.36*smoothstep(.52,.96,r);                 // vignette 暗角
+   gl_FragColor=vec4(c,1.);
+  }`,post.uF);
+}
+
+/* ============================================================
+   audio
+============================================================ */
+const audio=document.getElementById('song');
+let actx,analyser,freq;
+let sBass=0,sMid=0,sHigh=0,sLevel=0,beat=0,bassAvg=.1,lastBeat=0,beatJust=false;
+function setupAudio(){
+ actx=new (window.AudioContext||window.webkitAudioContext)();
+ const s=actx.createMediaElementSource(audio);
+ analyser=actx.createAnalyser();analyser.fftSize=2048;analyser.smoothingTimeConstant=.72;
+ s.connect(analyser);analyser.connect(actx.destination);
+ freq=new Uint8Array(analyser.frequencyBinCount);
+}
+function band(lo,hi){const nyq=actx.sampleRate/2,n=freq.length;
+ let a=Math.floor(lo/nyq*n),b=Math.min(Math.ceil(hi/nyq*n),n-1),s=0;
+ for(let i=a;i<=b;i++)s+=freq[i];return s/((b-a+1)*255);}
+
+const overlay=document.getElementById('overlay'),errEl=document.getElementById('err');
+let started=false;
+const DEMO=new URLSearchParams(location.search).get('demo');
+if(DEMO!==null)overlay.style.display='none';
+overlay.addEventListener('click',async()=>{
+ if(started)return;
+ try{if(!actx)setupAudio();await actx.resume();await audio.play();
+  started=true;overlay.classList.add('hidden');}
+ catch(e){errEl.style.display='block';
+  errEl.textContent='无法加载音频：请在此文件夹运行 python -m http.server 8173 后打开 http://localhost:8173/vj3d.html';}
+});
+addEventListener('keydown',e=>{
+ if(e.key==='f'||e.key==='F'){document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen();}
+ if(e.key===' '){e.preventDefault();audio.paused?audio.play():audio.pause();}
+});
+let cursorTimer;
+addEventListener('mousemove',()=>{document.body.classList.remove('hidecursor');
+ clearTimeout(cursorTimer);
+ cursorTimer=setTimeout(()=>document.body.classList.add('hidecursor'),2500);});
+
+/* ============================================================
+   main loop — first-person walk, butterfly leads 蝶引路
+============================================================ */
+const BPM=129,BEAT_MIN=(60/BPM)*.85;
+/* Cinematography Engine: 15 套闭环复合运镜（叠加于叙事路径，振幅克制）
+   全部基于视线焦点 look 的相对空间基向量（fwd/right/up）计算 */
+const UPV=new THREE.Vector3(0,1,0),
+      CV1=new THREE.Vector3(),CV2=new THREE.Vector3(),CV3=new THREE.Vector3(),
+      LOOKT=new THREE.Vector3();
+const CAMSEQ=[
+ p=>({x:Math.sin(p)*.5,y:0,z:0}),                                // 横移环
+ p=>({x:Math.sin(p)*.4,y:Math.sin(p*2)*.18,z:0}),                // 8字
+ p=>({x:0,y:Math.sin(p)*.25,z:Math.cos(p)*.4}),                  // 呼吸推拉
+ p=>({x:Math.cos(p)*.45,y:Math.sin(p)*.2,z:0}),                  // 环弧
+ p=>({x:Math.sin(p)*.3,y:.12*Math.sin(p*3),z:Math.sin(p*2)*.25}),
+ p=>({x:0,y:0,z:Math.sin(p)*.55}),                               // 纯推拉
+ p=>({x:Math.sin(p*2)*.22,y:Math.cos(p)*.22,z:0}),
+ p=>({x:Math.sin(p)*.55,y:0,z:Math.cos(p*2)*.18}),
+ p=>({x:0,y:Math.abs(Math.sin(p))*.3-.15,z:0}),                  // 起伏
+ p=>({x:Math.cos(p*3)*.15,y:Math.sin(p*2)*.15,z:Math.sin(p)*.3}),
+ p=>({x:Math.sin(p)*.35,y:Math.sin(p+1.6)*.2,z:Math.sin(p*.5)*.2}),
+ p=>({x:Math.cos(p)*.3,y:.1,z:Math.sin(p)*.3}),                  // 螺旋
+ p=>({x:Math.sin(p*4)*.08,y:Math.cos(p*4)*.08,z:0}),             // 微震
+ p=>({x:Math.sin(p)*.5,y:Math.cos(p*2)*.12,z:Math.cos(p)*.25}),
+ p=>({x:0,y:Math.sin(p*2)*.22,z:Math.cos(p*2)*.22})];
+// journey: valley walk → bamboo corridor → stop at the dance pool (z −152.5)
+const CAMZ=[[0,12],[8,4],[26,-16],[48,-52],[70,-92],[86,-122],[94,-140],
+ [100,-149],[105,-152.5],[400,-152.5]];
+let lastNow=0,camZ=12,scatter=0,nextDing=0,nextThunder=0,lastTs=-1,danceT=0,
+    lastRip=-9,ripI=0,nextFishT=6,nextDripT=0;
+let bolt=0,lastBoltT=-9,boltT0=-9,flapPhase=0,flapBurst=0,flapCur=1,fovKick=0,megaGlow=0;
+let blinkC=0;                                          // 眨眼时钟 — 自走+播放中校相
+const boltPulses=[];   // [offset, amplitude] — return strokes 回击
+const BP=new THREE.Vector3(riverX(4),groundH(riverX(4),4)+1.6,4);   // butterfly pos (起于河心)
+const BV=new THREE.Vector3(); let bYaw=Math.PI,bBank=0;
+const B2P=new THREE.Vector3(-2.74,-.3,-203.55);                   // 泪蝶：生于落泪处(眼角正下方)
+let b2Born=false;                                                 // 泪落化蝶的诞生标记
+const B2V=new THREE.Vector3(); let b2Yaw=0,b2Bank=0;
+const MEETP=new THREE.Vector3();                                  // 定格后双蝶靠拢的相遇点
+const ripple=(x,z,a)=>{waterU.uRip.value[ripI].set(x,z,lastNow,a);ripI=(ripI+1)%6;};
+const look=new THREE.Vector3(0,1.6,-10);
+const fogDay=new THREE.Color(0x9fc4a8),fogNight=new THREE.Color(0x0a1a12),
+      fogDanger=new THREE.Color(0x050d09),fogC=new THREE.Color(),
+      fogVil=new THREE.Color(0xbda291),                     // 苗寨夕阳霞雾(去橙、柔和，远处不发闷)
+      fogDusk=new THREE.Color(0x6b82ac),                    // 旧村庄暮蓝，改用于第二段(雨谷)
+      fogPurp=new THREE.Color(0x5a3d8a),                    // 巨雷紫
+      hemiVil=new THREE.Color(0xe6d8c8),hemiDay=new THREE.Color(0xcfe8d0),
+      hemiDusk=new THREE.Color(0xc6d6f6);                   // 旧村庄暮蓝半球光
+const t0=performance.now();
+
+function frame(){
+ requestAnimationFrame(frame);
+ const now=(performance.now()-t0)/1000;
+ const dt=Math.min(now-lastNow,.05);lastNow=now;
+
+ /* audio */
+ if(analyser&&started&&!audio.paused){
+  analyser.getByteFrequencyData(freq);
+  const bass=band(30,250),mid=band(250,2000),high=band(4000,12000);
+  let sum=0;for(let i=0;i<freq.length;i++)sum+=freq[i];
+  const level=sum/(freq.length*255),k=.12;
+  sBass+=(bass-sBass)*k*2.2;sMid+=(mid-sMid)*k*1.6;
+  sHigh+=(high-sHigh)*k*1.6;sLevel+=(level-sLevel)*k;
+  bassAvg+=(bass-bassAvg)*.015;
+  if(bass>bassAvg*1.35&&bass>.12&&(audio.currentTime-lastBeat)>BEAT_MIN){
+   beat=1;lastBeat=audio.currentTime;beatJust=true;}
+ }
+ beat*=.92;
+
+ /* timeline */
+ let ts,N;
+ if(started){ts=audio.currentTime;N=narrative(ts);}
+ else if(DEMO!==null){ts=parseFloat(DEMO)+now;N=narrative(ts);
+  sHigh=.4+.3*Math.sin(now*2.1);sMid=.4+.3*Math.sin(now*1.3);sBass=.4;
+  if(now-lastBeat>60/BPM){beat=1;lastBeat=now;beatJust=true;}}
+ else{ts=20+now*.3%60;N={danger:0,figure:1,summon:0};sMid=.4;sHigh=.3;}
+ const live=started||DEMO!==null;
+ const secv=live?sectionAt(ts):.35;
+ const stormV=live?curve(STORM,ts):.25;
+ const windGate=live?Math.min(Math.max((ts-37)/4,0),1):0; // 下雨(~37s)前无风：竹林静止
+ const windV=(live?curve(WINDC,ts):.4)*windGate;
+ const nightV=live?curve(NIGHTC,ts):0;
+ const finale=live?env(ts,124,127,152,160):0;
+ const seal=live?env(ts,151.6,153,160,166):0;
+ const riverApp=live?env(ts,53.06,54.8,68,71):1;       // 巨雷(52.06)后1s河流显现，呈现约15s
+ const poolA=live?env(ts,96,104,163,166):0;            // 舞台水池窗口(与poolU同步)
+ const mirA=Math.max(riverApp,poolA);                  // 有水才有倒影
+
+ /* 视线xz朝向 — 雷永远落在看得见的方向 */
+ const fvx0=look.x-camera.position.x,fvz0=look.z-camera.position.z,
+       fvl=Math.hypot(fvx0,fvz0)||1,fvx=fvx0/fvl,fvz=fvz0/fvl;
+
+ /* dings → scatter */
+ if(live){
+  if(lastTs<0||Math.abs(ts-lastTs)>1.5){
+   nextDing=DINGS.findIndex(d=>d[0]>ts);if(nextDing<0)nextDing=DINGS.length;
+   nextThunder=THUNDER.findIndex(t2=>t2>ts);if(nextThunder<0)nextThunder=THUNDER.length;}
+  while(nextDing<DINGS.length&&ts>=DINGS[nextDing][0]-.03){
+   scatter=1;fovKick=1;
+   if(ts>82){                                              // 入夜后，叮才引近雷
+    dingU.uT0.value=now;
+    dingU.uAmp.value=.7+.4*(DINGS[nextDing][1]||1);
+    const dc=spawnDingStorm(camera.position.x,camera.position.z,false,false,fvx,fvz);
+    flash.position.set(dc.x,60,dc.z);flash.target.position.set(dc.x,0,dc.z);
+    boltT0=now;boltPulses.length=0;
+    boltPulses.push([0,.9],[.2+Math.random()*.1,.5]);
+    lastBoltT=now;
+   }
+   if(BP.y<1.8&&Math.abs(BP.x-riverX(BP.z))<3.4)ripple(BP.x,BP.z,1.4);  // 银铃落水
+   nextDing++;}
+  while(nextThunder<THUNDER.length&&ts>=THUNDER[nextThunder]-.03){
+   scatter=1;fovKick=2.1;                                  // 忽而雷声隐隐 — 最大的雷
+   dingU.uT0.value=now;dingU.uAmp.value=2.6;
+   const first=nextThunder===0;
+   BV.y+=first?3:1.5;flapBurst=1;                      // 惊雷 — 蝶受惊振翅急升
+   let ax=camera.position.x,az=camera.position.z;
+   if(first){ax+=fvx*150;az+=fvz*150;}                     // 首声：视线正前方极远处
+   const dc=spawnDingStorm(ax,az,true,first,fvx,fvz);
+   flash.position.set(dc.x,62,dc.z);flash.target.position.set(dc.x,0,dc.z);
+   boltT0=now;boltPulses.length=0;                         // 天地尽白，连环四击
+   boltPulses.push([0,1.9],[.22,1.3],[.5,.85],[.85,.5]);
+   lastBoltT=now;megaGlow=1;                               // 天泛紫
+   nextThunder++;}
+  lastTs=ts;
+ }
+ scatter*=Math.exp(-dt*1.6);fovKick*=Math.exp(-dt*3.);
+
+ /* lightning */
+ const pB=boltWindow(ts);
+ if(pB>0&&now-lastBoltT>1.4){
+  if((beatJust&&sBass>.3&&Math.random()<pB)||(now-lastBoltT>7+Math.random()*6&&pB>.3)){
+   lastBoltT=now;boltT0=now;boltPulses.length=0;
+   let acc=0,amp=1;
+   const np=2+Math.floor(Math.random()*3);       // main stroke + 1-4 restrikes
+   for(let i=0;i<np;i++){boltPulses.push([acc,amp]);
+    acc+=.06+Math.random()*.12;amp*=.55+Math.random()*.25;}
+   const bp=spawnBolt(camera.position.x,camera.position.z,fvx,fvz);  // 视线前方落雷
+   flash.position.set(bp.x,55,bp.z);flash.target.position.set(bp.x,0,bp.z);}}
+ beatJust=false;
+ bolt=0;                                          // sharp attack, fast decay per stroke
+ for(const[p,a]of boltPulses){const u=now-boltT0-p;
+  if(u>0)bolt+=a*Math.exp(-u*24);}
+ if(boltT0>0&&now-boltT0<1.4)bolt+=.16*Math.exp(-(now-boltT0)*4);  // afterglow
+ bolt=Math.min(bolt,1.5);
+
+ /* camera journey 行旅：河谷 → 竹林长廊 → 潭边驻足看她起舞 */
+ const targZ=live?curve(CAMZ,ts):12-(now*.55)%46;
+ const dance=live?env(ts,90,99,151.6,154):0;
+ const growV=live?env(ts,126,146,1000,1001):0;         // 幻树生长进度
+ const dreamPeek=live?env(ts,53.5,55.5,61,64):0;       // 湖面梦境蝶群浮现：主蝶驻足俯看，镜头低垂暗示另一个世界
+ // Frustum Fitting: 由视锥反推巨眼的停靠距离 dock，并施加空间裁剪边界
+ let targZ2=targZ;
+ if(growV>0){
+  const fitH=14/(2*Math.tan(camera.fov*Math.PI/360));
+  const fitW=27/(2*Math.tan(camera.fov*Math.PI/360)*camera.aspect);
+  const dock=-205+Math.max(fitH,fitW)*1.9;
+  targZ2=Math.max(Math.min(targZ+(dock-targZ)*growV*.5,targZ),-178); // clamp bounds
+ }
+ if(Math.abs(targZ2-camZ)>40)camZ=targZ2;             // seek: snap, no swoosh
+ const prevZ=camZ;
+ camZ+=(targZ2-camZ)*Math.min(dt*1.2*(1-dreamPeek*.35),1);  // 驻足俯看时镜头稍缓，留白
+ const spdNow=Math.min(Math.abs(camZ-prevZ)/Math.max(dt,.001),3.2);
+ const cx=pathX(camZ)+(Math.sin(now*.06)*1.2+Math.sin(now*.023)*.7)*dance;
+ const cy=Math.max(groundH(cx,camZ),-.35)+1.65
+   +Math.sin(now*1.9)*.035*spdNow+Math.sin(now*3.7)*.015*stormV;
+ camera.position.set(cx,cy,camZ);
+ {                                                    // 复合运镜（段间振幅归零→无缝衔接）
+  const st=ts/9,f=st-Math.floor(st);
+  const amp=Math.min(1,Math.min(f,1-f)*8);            // 序列边界处振幅平滑归零
+  const o=CAMSEQ[Math.floor(st)%15](f*6.283,now);
+  o.x*=amp;o.y*=amp;o.z*=amp;
+  CV1.copy(look).sub(camera.position);CV1.y=0;
+  if(CV1.lengthSq()>1e-4){
+   CV1.normalize();
+   CV2.crossVectors(CV1,UPV).normalize();
+   CV3.crossVectors(CV2,CV1);
+   camera.position.addScaledVector(CV2,o.x)
+     .addScaledVector(CV3,o.y).addScaledVector(CV1,o.z);
+  }
+ }
+
+ /* butterfly: leads the walk, then dances barefoot on the pool 引路→赤足起舞 */
+ const waiting=N.summon>.35&&secv<.4&&dance<.5;
+ danceT+=dt*(1.1+secv*1.6+sBass*.9)*dance;
+ const ld=1-dance;
+ const tzL=camZ-(8.5-dreamPeek*3.2)-Math.sin(now*.23)*1.4*(1-dreamPeek*.7); // 驻足俯看时靠近、少漂
+ const perch=live?env(ts,10.9,11.5,12.3,13.1)+env(ts,26.0,26.6,28.4,29.2):0; // 浮萍小憩·低掠河面
+ const sway=(Math.sin(now*.24)*1.5+Math.sin(now*.11)*.8)*(1-perch*.7)*(1-dreamPeek*.8); // 沿主线的左右轻摆
+ let txL=riverX(tzL)+sway;                             // 沿河道主线(湖心)飞，掠水时更贴中心
+ const wnd=1.-growV*.65;                                          // 巨眼成形时收拢
+ const txD=(Math.sin(danceT*1.5)*2.2+Math.sin(danceT*.37)*.8)*wnd+growV*1.3; // 收向眼下右位
+ const tzD=-161-growV*42+(Math.sin(danceT*3.0)*1.6+Math.cos(danceT*.51)*1.2)*wnd;
+ const tx=txL*ld+txD*dance, tz=tzL*ld+tzD*dance;
+ const bLift=(live?env(ts,122,134,1000,1001):0)*(1-growV); // 竹林沉落期蝶升包络
+ const tyBase=(Math.max(groundH(tx,tz),-.35)+(waiting?1.2:2.2-perch*1.7-dreamPeek*1.5))*ld+(1.7+growV*12.9)*dance
+   +bLift*5;                                             // 旋舞抬高·与倒影拉开; 沉林再升; 终归眼下; 俯看时低掠湖面
+ // physics: gravity + wingbeat lift on the drum
+ BV.y-=2.0*dt*(1+dance*1.2);
+ BV.x*=Math.pow(.4,dt);BV.z*=Math.pow(.4,dt);BV.y*=Math.pow(.5,dt);
+ const spring=(1.2+dance*1.5)*(1-dreamPeek*.45)*dt;     // 驻足时更缓，像悬停凝视
+ BV.x+=(tx-BP.x)*spring;BV.z+=(tz-BP.z)*spring;
+ if(beat>.9&&N.figure>.02){
+  BV.y+=(0.9+.5*secv)*(BP.y<tyBase+.3?1.3:1)*(1+dance*.3);flapBurst=1;
+ }
+ if(waiting)BV.y+=1.4*dt;
+ if(BP.y<tyBase-.6){BV.y=Math.max(BV.y,.5+dance*.5);   // 赤足点水 → 涟漪
+  if(dance>.4&&now-lastRip>.22&&Math.abs(BP.x-riverX(BP.z))<3.4){ripple(BP.x,BP.z,.8+beat*.6);lastRip=now;}}
+ flapBurst*=Math.exp(-dt*3.5);
+ if(seal>0.01){BV.multiplyScalar(0);                   // 定格 freeze-frame
+  if(b2Born){MEETP.set((BP.x+B2P.x)/2+.45,(BP.y+B2P.y)/2,(BP.z+B2P.z)/2);
+   BP.lerp(MEETP,Math.min(dt*2.4,1));}}                // 定格后靠向泪蝶，153s 翅尖相接
+ else BP.addScaledVector(BV,dt);
+ BP.y=Math.min(BP.y,tyBase+3.5);
+ flapPhase+=dt*(1.6+flapBurst*15+BV.length()*1.2+secv*1.5);
+ flapCur=Math.abs(Math.sin(flapPhase));
+ if(perch>.6&&BP.y<1.1&&Math.abs(BP.x-riverX(BP.z))<3.4&&now-lastRip>(ts<20?.85:.3)){
+  ripple(BP.x,BP.z,ts<20?.7:.4);lastRip=now;}          // 落萍一拍 / 掠水拉出水痕
+ bYaw+=((Math.atan2(BV.x,BV.z)+Math.PI)-bYaw)*Math.min(dt*2.5,1)*Math.min(BV.length(),1)*ld;
+ bYaw+=dt*dance*(1.6+beat*5+sMid*2.5);                 // pirouette 旋舞
+ bBank+=((-Math.max(-.6,Math.min(.6,BV.x*.5)))*ld
+   +Math.sin(danceT*2.1)*.5*dance-bBank)*Math.min(dt*4,1);
+
+ /* 泪蝶 #2 — 泪落化蝶，与青蝶镜像双飞，定格眼下 */
+ const fig2=live?env(ts,TEAR_HIT,TEAR_HIT+1.3,163,166):0;     // 泪蝶随泪落潭而生
+ const gRef=live?env(ts,100,106,TEAR_HIT-.7,TEAR_HIT):0;      // 预兆:只活在湖面倒影里的她 落潭即逝
+ if(gRef>0.001&&fig2<=0.001){
+  B2P.set(-BP.x,BP.y,BP.z);                            // 镜像青蝶共舞 本体不可见
+  b2Yaw=-bYaw;b2Bank=-bBank;
+ }
+ if(fig2<=0.001)b2Born=false;
+ if(fig2>0.001){
+  if(!b2Born){B2P.set(-2.74,-.3,-203.55);B2V.set(0,0,0);b2Born=true;} // 泪落处真身成形
+  const tx2=-tx;                                        // 镜像目标：终点 (−1.3, 14.6)
+  const tz2=tz+Math.sin(now*1.1)*.6;
+  const ty2=tyBase+Math.sin(now*1.7+2.1)*.5;
+  B2V.y-=2.0*dt*(1+dance*1.2);
+  B2V.x*=Math.pow(.4,dt);B2V.z*=Math.pow(.4,dt);B2V.y*=Math.pow(.5,dt);
+  B2V.x+=(tx2-B2P.x)*spring;B2V.z+=(tz2-B2P.z)*spring;
+  if(beat>.9)B2V.y+=(0.9+.5*secv)*(B2P.y<ty2+.3?1.3:1);
+  if(B2P.y<ty2-.6)B2V.y=Math.max(B2V.y,.5+dance*.5);
+  if(seal>0.01){B2V.multiplyScalar(0);                  // 双双定格
+   MEETP.set((BP.x+B2P.x)/2-.45,(BP.y+B2P.y)/2,(BP.z+B2P.z)/2);
+   B2P.lerp(MEETP,Math.min(dt*2.4,1));}                 // 靠向相遇点
+  else B2P.addScaledVector(B2V,dt);
+  B2P.y=Math.min(B2P.y,ty2+3.5);
+  b2Yaw+=((Math.atan2(B2V.x,B2V.z)+Math.PI)-b2Yaw)*Math.min(dt*2.5,1)*Math.min(B2V.length(),1)*ld;
+  b2Yaw-=dt*dance*(1.6+beat*5+sMid*2.5);                // 反向旋舞
+  b2Bank+=(-(-Math.max(-.6,Math.min(.6,B2V.x*.5)))*ld
+    -Math.sin(danceT*2.1)*.5*dance-b2Bank)*Math.min(dt*4,1);
+ }
+
+ /* 蝶尾光迹 — drop one trail mote per frame */
+ {
+  const pa=trGeo.attributes.position.array,da=trGeo.attributes.aD.array;
+  pa[trI*3]=BP.x+(Math.random()-.5)*.06;
+  pa[trI*3+1]=BP.y+(Math.random()-.5)*.06;
+  pa[trI*3+2]=BP.z+(Math.random()-.5)*.06;
+  da[trI*2]=now;
+  da[trI*2+1]=Math.max(N.figure,seal*.9)
+    *(.22+Math.min(BV.length()*.6,1.))*(1+growV*1.2);
+  trI=(trI+1)%TRN;
+  if(fig2>0.001){                                      // 泪蝶的第二条光迹
+   pa[trI*3]=B2P.x+(Math.random()-.5)*.06;
+   pa[trI*3+1]=B2P.y+(Math.random()-.5)*.06;
+   pa[trI*3+2]=B2P.z+(Math.random()-.5)*.06;
+   da[trI*2]=now;
+   da[trI*2+1]=fig2*(.22+Math.min(B2V.length()*.6,1.))*(1+growV*1.2);
+   trI=(trI+1)%TRN;
+  }
+  trGeo.attributes.position.needsUpdate=true;
+  trGeo.attributes.aD.needsUpdate=true;
+ }
+
+ /* camera looks at the guide; tilts up to take in the ghost trees 仰视幻树 */
+ LOOKT.set(
+  BP.x*.62+(cx)*.38, BP.y*.55+(cy-.1)*.45+growV*13.+bLift*3.-dreamPeek*1.7, BP.z*.8+(camZ-14)*.2-growV*22.);
+ // dreamPeek: 视线随主蝶低垂，俯向湖面另一个世界
+ look.lerp(LOOKT,Math.min(dt*2.2,1));
+ camera.lookAt(look);
+ camera.fov=62+fovKick*3+finale*2*Math.sin(now*.28);
+ camera.updateProjectionMatrix();
+
+ /* environment lerps 环境 — 苗寨暮蓝 ⇄ 雨谷青绿 两套色系 */
+ const chor=live?env(ts,49,54.5,1000,1001):1;          // 副歌起换色系
+ megaGlow*=Math.exp(-dt*1.1);                          // 紫色天光缓缓褪去
+ const vil2=live?env(ts,50,55,80,91):0;                // 第二段(雨谷)旧暮蓝色系窗口
+ fogC.copy(fogVil).lerp(fogDay,chor).lerp(fogDusk,vil2).lerp(fogNight,nightV).lerp(fogDanger,N.danger*.7)
+   .lerp(fogPurp,megaGlow*.4);
+ scene.fog.color.copy(fogC);
+ scene.fog.density=.014+stormV*.010+N.danger*.008
+   +(live?env(ts,50,58,86,96)*.009:0)                  // 竹林里雾更浓
+   +(live?env(ts,48.5,51.5,52.5,56)*.014:0);           // 转场：雾一拢，换了天地
+ hemi.color.copy(hemiVil).lerp(hemiDay,chor).lerp(hemiDusk,vil2);
+ renderer.toneMappingExposure=1.05+(1-chor)*.52;       // 苗寨段曝光（略降以保夕阳饱和度，不洗白）
+ renderer.setClearColor(fogC);
+ hemi.intensity=1.0-nightV*.72-N.danger*.15+(1-chor)*.82;  // 低日位下靠暖天光补地面
+ {const vil=1-chor;                                     // 苗寨段夕阳暖光（更橙）
+  sun.color.setRGB(1,(.95-nightV*.15)*(1-vil*.28),(.8+nightV*.1)*(1-vil*.52));}
+ sun.intensity=(1.3-nightV*.8)*(1-stormV*.3)+bolt*4+(1-chor)*.55;  // 夕照更亮
+ sunNow.copy(sunEve).lerp(sunDir,chor);                // 苗寨段太阳压到地平线，其后回常规日位
+ skyU.uSunDir.value.copy(sunNow);
+ sun.position.copy(camera.position).addScaledVector(sunNow,120);
+ sun.target.position.copy(camera.position);
+ flash.intensity=bolt*5;
+
+ /* uniforms */
+ skyU.uT.value=now;skyU.uNight.value=nightV;skyU.uStorm.value=stormV;
+ skyU.uSec.value=secv;skyU.uMid.value=sMid;skyU.uBeat.value=beat;
+ skyU.uBolt.value=bolt;skyU.uDanger.value=N.danger;
+ skyU.uVil.value=1-chor;waterU.uVil.value=1-chor;
+ skyU.uVil2.value=vil2;waterU.uVil2.value=vil2;
+ skyU.uClear.value=live?env(ts,158.5,161.5,1000,1001):0; // 眼感染尽→天光消散(先于银河浮现)
+// if(terrainU)terrainU.uVilG.value=1-chor;              // 苗寨段地面夕照提亮
+ if(terrainU)terrainU.uVilG.value=0.4*(1-chor);              // 苗寨段地面夕照提亮
+ skyU.uPurple.value=megaGlow;
+ sky.position.copy(camera.position);
+ waterU.uT.value=now;waterU.uNight.value=nightV;waterU.uSec.value=secv;
+ waterU.uHigh.value=sHigh;waterU.uBeat.value=beat;
+ waterU.uFogC.value.copy(fogC);waterU.uFogD.value=scene.fog.density;
+ waterU.uApp.value=mirA;                               // 巨雷后1s河流现身; 潭段随水池回归(涟漪/倒影所在)
+ rvBfU.uT.value=now;rvBfU.uCamZ.value=camZ;            // 河中蝶界 — 随河同现同隐
+ rvBfU.uApp.value=live?env(ts,53.3,55.8,66.5,70):0;    // 过完河流蝶群散去
+ rvBfU.uPx.value=devicePixelRatio*innerHeight*.85;
+ rainU.uT.value=now;rainU.uCam.value.copy(camera.position);
+ rainU.uAmt.value=Math.min(stormV*.92+sHigh*.2*Math.min(stormV*6,1),1)
+   *(1+beat*.18*env(ts,65.4,66.2,79,80.5));            // 「滴滴答滴滴」— 雨随心跳微脉动
+ rainU.uWind.value=windV;rainU.uNight.value=nightV;rainU.uSpd.value=1+stormV*.8;
+ mistU.uT.value=now;mistU.uCam.value.copy(camera.position);
+ mistU.uNight.value=nightV;mistU.uHigh.value=sHigh;mistU.uDing.value=scatter;
+ mistU.uPx.value=devicePixelRatio*innerHeight*0.85;   // px per meter at 1m
+ bfU.uT.value=now;bfU.uBPos.value.copy(BP);bfU.uFlap.value=flapCur;
+ bfU.uYaw.value=bYaw+(.45+.6*Math.sin(now*.33))*ld;    // 引路时常保3/4侧姿 翅面朝镜头
+ bfU.uBank.value=bBank;bfU.uScat.value=scatter;
+ bfU.uFig.value=Math.max(N.figure,seal*.9)*(live?1:1);
+ bfU.uRed.value=seal;bfU.uNight.value=nightV;bfU.uBeat.value=beat;
+ bfU.uPx.value=devicePixelRatio*innerHeight*0.85;bfU.uGrow.value=growV;
+ bfU.uMirA.value=mirA;bf2U.uMirA.value=mirA;ghostU.uMirA.value=mirA;
+ {/* 心情三段:微暖(一点点开心)→巨雷后大红(狂喜)→入夜褪回青(心情down) */
+  const moodR=live?env(ts,52.1,54.5,80,93):0;         // 52.06首雷起燃 随天黑褪去
+  const moodW=live?env(ts,0,.1,50,52.1):0;            // 前半一点点暖意
+  bfU.uTint.value.set(1+moodW*.3+moodR*2.2,
+                      1+moodW*.03-moodR*.72,
+                      1-moodW*.12-moodR*.74);}
+ bf2U.uT.value=now;bf2U.uBPos.value.copy(B2P);
+ bf2U.uFlap.value=Math.abs(Math.sin(flapPhase+1.35));  // 错拍振翅
+ bf2U.uYaw.value=b2Yaw;bf2U.uBank.value=b2Bank;bf2U.uScat.value=scatter;
+ bf2U.uFig.value=fig2*.95;bf2U.uFigM.value=gRef*.9;    // 预兆只亮在倒影通道
+ bf2U.uRed.value=seal;bf2U.uNight.value=nightV;
+ bf2U.uBeat.value=beat;bf2U.uPx.value=devicePixelRatio*innerHeight*0.85;
+ bf2U.uGrow.value=growV;
+ ghostU.uT.value=now;ghostU.uBeat.value=beat;
+ ghostU.uGrow.value=growV;                             // 红雨在最后40s缠绕成巨蝶
+ ghostU.uDrop.value=live?env(ts,112,126,1000,1001):0;  // 红雨滴提前14s慢慢飘落
+ ghostU.uSeal.value=seal;                              // 点睛：巨蝶被点活
+ ghostU.uEye.value=growV;                              // 眼随红雨成形，停留至曲终
+ ghostU.uGT.value=live?Math.max(ts-126,0):0;           // 物理回振的到位计时
+ ghostU.uBoltG.value=bolt;                             // 雷光→瞳孔收缩
+ ghostU.uPx.value=devicePixelRatio*innerHeight*0.85;
+ /* 眨眼时钟 — 一直自走(暂停也照常眨)，播放中缓缓校相：
+    眼全闭恰在挣脱起始 TEAR_T0+TEAR_GROW — 闭眼一瞬泪珠开始降落(相位 π/2÷1.05=1.496) */
+ blinkC+=dt;
+ if(live&&!(started&&audio.paused)){
+  const bTgt=ts-((TEAR_T0+TEAR_GROW)-1.496);
+  const bErr=bTgt-blinkC;
+  if(Math.abs(bErr)>3)blinkC=bTgt;                     // seek/长停后直接对相
+  else blinkC+=bErr*Math.min(dt*.8,1);                 // 播放中渐渐校准
+ }
+ ghostU.uTb.value=blinkC;
+ /* 终章银河 — 巨眼被感染尽(~159s)、天光消散之后，云层徐徐散开，早已就位的星河一片片透出，悬空直到曲终 */
+ galaxyU.uT.value=now;
+ galaxyU.uPx.value=devicePixelRatio*innerHeight*0.85;
+ galaxyU.uApp.value=live?env(ts,159.2,161.2,1000,1001):0;   // 浮现后常驻至曲终
+ galaxyU.uForm.value=live?Math.min(Math.max((ts-159.2)/8,0),1):0; // /8=云散总秒数(越大越慢):云薄处星先透 云厚处最后
+ galaxyU.uMirA.value=mirA;                                  // 潭面星河倒影 随水同现同隐
+ galaxyM.visible=galaxyU.uApp.value>.003;                   // 终章前不进渲染
+ /* —— 歌词意境应和 —— */
+ lampU.uCrush.value=live?env(ts,14.9,15.7,17.4,18.8):0;    // 「窗帘它揉碎了灯影」
+ mistU.uLow.value=live?env(ts,0,.15,5.6,7.3):0;            // 开场云雾低垂 首句唱出时抬起让景
+ const seaV=live?env(ts,58.4,59.4,61.6,62.7):0;            // 「发不出声音 吞入海底」(仅第一遍)
+ skyU.uSea.value=seaV;
+ bubU.uT.value=now;bubU.uA.value=seaV*.8;
+ bubU.uPx.value=devicePixelRatio*innerHeight*.85;
+ bubU.uCam.value.copy(camera.position);
+ const yrV=live?env(ts,40.6,41.5,43.6,44.9):0;             // 「年轮刻下的伏笔」
+ ringU.uT.value=now;ringU.uPx.value=devicePixelRatio*innerHeight*.85;
+ ringU.uRT.value=yrV>0?ts-40.6:-1;
+ if(yrV>0&&!ringOn){const rz=camZ-15,rx=pathX(rz)+5.6;     // 现于路侧树干 面向镜头
+  ringM.position.set(rx,Math.max(groundH(rx,rz),-.3)+2.7,rz);
+  ringM.rotation.y=Math.atan2(camera.position.x-rx,camera.position.z-rz);
+  ringOn=true;}
+ if(yrV<=0)ringOn=false;
+ const reun=live?env(ts,161.5,162.8,164.6,165.9):0;        // 倒影里的重逢 — 只活在潭面倒影
+ if(reun>0){
+  const ra=(ts-161.5)*.5;
+  const bx=Math.sin(ra)*3.2,bz=-197-(ts-161.5)*1.2,by=2.4+Math.sin(now*1.3)*.45;
+  bfU.uBPos.value.set(bx,by,bz);bf2U.uBPos.value.set(-bx,by+.5,bz-.9);
+  bfU.uFlap.value=Math.abs(Math.sin(now*3.1));
+  bf2U.uFlap.value=Math.abs(Math.sin(now*3.1+1.15));
+ }
+ bfU.uFigM.value=reun*.85;
+ bf2U.uFigM.value=Math.max(bf2U.uFigM.value,reun*.85);
+ ghostU.uAsc.value=live?Math.min(Math.max((ts-164.6)/3.4,0),1):0; // 双星入河: 蝶影升天(聚蝶完成后启程 与星交接)
+ /* 相遇→波纹→吞眼→化蝶 devour（~153s 双蝶一相遇立即起波纹） */
+ const meetT=153.0;
+ if(seal>0.01&&b2Born&&(BP.z+B2P.z)/2<-180)meetRipU.uCtr.value.set(
+   (BP.x+B2P.x)/2,(BP.y+B2P.y)/2,(BP.z+B2P.z)/2+.6);   // 波纹面略靠镜头; 双蝶未抵眼下(seek)则用默认圆心
+ meetRipU.uT.value=now;meetRipU.uRT.value=live?ts-meetT:-1;
+ meetRipU.uPx.value=devicePixelRatio*innerHeight*.85;
+ ghostU.uDevR.value=live?Math.max(ts-meetT,0)*3:0;     // 感染波扫过眼面的半径
+ if(seal>0.01&&b2Born&&(BP.z+B2P.z)/2<-180){           // 双蝶已抵眼下：两只蝴蝶各自为感染源
+  ghostU.uDevC.value.set(BP.x-ghostU.uCtr.value.x,BP.y-ghostU.uCtr.value.y);
+  ghostU.uDevC2.value.set(B2P.x-ghostU.uCtr.value.x,B2P.y-ghostU.uCtr.value.y);
+ }else{                                                // seek/未抵位：回落默认圆心
+  ghostU.uDevC.value.set(meetRipU.uCtr.value.x-ghostU.uCtr.value.x,
+                         meetRipU.uCtr.value.y-ghostU.uCtr.value.y);
+  ghostU.uDevC2.value.copy(ghostU.uDevC.value);
+ }
+ ghostU.uBurst.value=live?env(ts,158.7,158.95,159.5,161.0):0;    // 爆散冲量+白闪(~159s)
+ ghostU.uReform.value=live?Math.min(Math.max((ts-159.0)/5.5,0),1):0; // 散落四方(159→160.8)→缓缓聚为蝶(→164.5); /5.5=总时长秒
+ const sinkV=live?env(ts,122,134,1000,1001):0;         // 幻树将升，林木缓缓沉落让景
+ const sinkS=sinkV*sinkV*(3-2*sinkV);
+ for(const o of sinkables)o.position.y=-46*sinkS;
+ for(let i=0;i<lyricItems.length;i++){const Li=lyricItems[i];
+  const el=ts-Li.t0;
+  if(!Li.fin){                                         // 行进段：悬在视线前方路侧
+   if(el>=-3&&el<=Li.dur+3){                           // 提前3s萤火起飞→等待位悬浮
+    const lane=i%2;
+    const z0=camZ-26;                                  // 跟随镜头保持距离，整句常驻视野
+    const x0=pathX(z0)+(lane?-1:1)*8.2;
+    if(!Li.placed){
+     const px0=pathX(z0)+(lane?1:-1)*8.2;
+     Li.mesh.position.set(x0,Li.H/2+2.8,z0);
+     const prevH=i>0?lyricItems[i-1].H:Li.H;
+     Li.u.uFromOff.value.set(px0-x0,(prevH-Li.H)*.5,0);
+     Li.placed=true;
+    }else{
+     const k=Math.min(dt*2.2,1);
+     Li.mesh.position.x+=(x0-Li.mesh.position.x)*k;
+     Li.mesh.position.z+=(z0-Li.mesh.position.z)*k;
+    }
+    Li.mesh.rotation.y=Math.atan2(camera.position.x-Li.mesh.position.x,
+                                  camera.position.z-Li.mesh.position.z);
+   }else if(el<-3)Li.placed=false;                     // seek 回退时可重放
+  }
+  const rw=Li.fin?3.2:Math.min(Li.dur*.85,4.5);      // 唱到哪句写到哪句；越大逐字落定越慢
+  Li.u.uRev.value=Math.min(Math.max(el/rw,0),1);
+  let op;
+  if(Li.fin){op=live?env(ts,Li.t0-3,Li.t0-2.4,163,166):0;
+   if(Li.nxt<1e8)op*=1-Math.min(Math.max((ts-Li.nxt)/3.2,0),1); // 下句一现 旧句衰弱至消失
+   else op*=1-Math.min(Math.max((ts-(Li.t0+5.2))/4.2,0),1);}    // 末句显示后散开并消弱到无
+  else op=live?env(ts,Li.t0-3,Li.t0-2.4,Li.t0+Li.dur,Li.t0+Li.dur+2.7):0; // 保持到下句开唱 再缓缓散尽
+  Li.u.uForm.value=Math.min(Math.max((el+3)/3,0),1);   // t0 时刻恰好抵达等待位
+  Li.u.uOp.value=op*(.88+.08*Math.sin(now*1.3+i*2.1));
+  Li.mesh.visible=Li.u.uOp.value>.003;                 // 未唱到的句子不进渲染
+  Li.u.uT.value=now;Li.u.uBolt.value=bolt;Li.u.uPx.value=devicePixelRatio*innerHeight*.85;}
+ boltU.uA.value=bolt;boltU.uT.value=now;
+ boltU.uPx.value=devicePixelRatio*innerHeight*0.85;
+ dingU.uT.value=now;dingU.uPx.value=devicePixelRatio*innerHeight*0.85;
+ lampU.uT.value=now;lampU.uPx.value=devicePixelRatio*innerHeight*0.85;
+ fireU.uT.value=now;fireU.uPx.value=lampU.uPx.value;fireU.uAmt.value=1-chor;
+ fireU.uAmt2.value=live?env(ts,82,92,120,132):0;      // 入夜萤火回归竹林 沉林前散去
+ leafU.uT.value=now;leafU.uPx.value=lampU.uPx.value;
+ leafU.uWind.value=windV;leafU.uCam.value.copy(camera.position);
+ leafU.uAmt.value=(live?env(ts,52,56,158,163):0)
+   *Math.min(Math.max((windV-.15)*1.6,0),1);          // 雷起风动 叶始飘落 风越大越密
+ for(const u of vegU){u.uVT.value=now;u.uVW.value=windV;u.uVR.value=nightV*.6;} // 全林风场+夜轮廓
+ canopyU.uT.value=now;canopyU.uW.value=windV;canopyU.uB.value=bolt;
+ canopyU.uN.value=nightV;canopyU.uPx.value=lampU.uPx.value;
+ smokeU.uT.value=now;smokeU.uPx.value=lampU.uPx.value;smokeU.uAmt.value=1-chor;
+ if(padsM){padsM.position.x=Math.sin(now*.04)*.5;      // 浮萍缓漂
+  padsM.position.z=Math.cos(now*.027)*.6;
+  padsM.visible=mirA>.02;}                             // 浮萍随水现身（河段/潭段）
+ if(live&&ts<52&&now>nextFishT){                       // 鱼跃 — 静水偶尔一圈
+  ripple((Math.random()-.5)*5,camZ-8-Math.random()*18,.5+Math.random()*.5);
+  nextFishT=now+6+Math.random()*8;
+ }
+ if(live&&ts>37.3&&ts<47&&now>nextDripT){              // 一点一滴→淅淅沥沥 首雨点点入水
+  ripple((Math.random()-.5)*4.6,camZ-6-Math.random()*15,.3+Math.random()*.35);
+  nextDripT=now+.3+Math.max(46-ts,0)*.14+Math.random()*.35; // 间隔渐密
+ }
+ trailU.uT.value=now;trailU.uPx.value=devicePixelRatio*innerHeight*0.85;
+ /* 前半伏笔驱动 */
+ const eh=live?env(ts,62.1,63.6,64.8,66.8):0;          // 云中之眼 一瞥即隐
+ eyeHintU.uT.value=now;eyeHintU.uA.value=eh*.15;      // 极淡 若隐若现
+ eyeHintU.uPx.value=devicePixelRatio*innerHeight*.85;
+ if(eh>0&&!eyeHintOn){
+  eyeHintM.position.set(camera.position.x+fvx*135,42,camera.position.z+fvz*135);
+  eyeHintM.rotation.y=Math.atan2(camera.position.x-eyeHintM.position.x,
+                                 camera.position.z-eyeHintM.position.z);
+  eyeHintOn=true;}
+ if(eh<=0)eyeHintOn=false;
+ eyeHintM.visible=eh>0.001;
+ redHintU.uT.value=now;redHintU.uPx.value=devicePixelRatio*innerHeight*.85;
+ if(live&&Math.abs(ts-76.45)<.06&&now-redHintU.uT0.value>5){ // 红印先兆:几滴红雨先至
+  redHintU.uT0.value=now;
+  redHintU.uC.value.set(camera.position.x+fvx*50,0,camera.position.z+fvz*50);}
+ footU.uT.value=now;footU.uPx.value=devicePixelRatio*innerHeight*.85;
+ if(live&&ts<25.9){footU.uWash.value=-1;
+  if(Math.abs(camZ-lastFootZ)>1.7){                    // 走过的路留足印
+   const fx2=cx+footSide*.4,fz2=camZ+1.4;
+   footGeo.attributes.position.array[footI*3]=fx2;
+   footGeo.attributes.position.array[footI*3+1]=Math.max(groundH(fx2,fz2),-.35)+.05;
+   footGeo.attributes.position.array[footI*3+2]=fz2;
+   footGeo.attributes.aB.array[footI]=now;
+   footGeo.attributes.position.needsUpdate=true;footGeo.attributes.aB.needsUpdate=true;
+   footI=(footI+1)%FOOTN;footSide*=-1;lastFootZ=camZ;}
+ }else if(live&&footU.uWash.value<0&&ts>=25.9&&ts<40)footU.uWash.value=now; // 河水洗掉足印
+ poolU.uT.value=now;
+ poolU.uAmt.value=live?env(ts,96,104,163,166):0;       // 舞台水池随旋舞浮现 曲终隐去
+ tearU.uTear.value=live?ts-TEAR_T0:-1;                  // 如你哭泣 — 泪
+ tearU.uPx.value=devicePixelRatio*innerHeight*0.85;
+ if(live&&Math.abs(ts-TEAR_HIT)<.06)ripple(-2.74,-203.55,1.3); // 泪落潭心(自由落体到达)
+
+
+ /* GPGPU 步进：pos/vel 双纹理 ping-pong，一帧一积分 */
+ if(GPU.ok){
+  for(const o of ghostObjs)o.visible=false;
+  for(const o of GPU.objs)o.visible=true;
+  const gu=GPU.u;
+  gu.uDt.value=Math.min(dt,.033);gu.uT.value=now;gu.uGrow.value=growV;
+  gu.uDrop.value=ghostU.uDrop.value;gu.uBeat.value=beat;gu.uBoltG.value=bolt;
+  gu.uDevR.value=ghostU.uDevR.value;gu.uDevC.value.copy(ghostU.uDevC.value);
+  gu.uDevC2.value.copy(ghostU.uDevC2.value);gu.uBurst.value=ghostU.uBurst.value;
+  gu.uReform.value=ghostU.uReform.value;gu.uTb.value=ghostU.uTb.value;
+  gu.uAsc.value=ghostU.uAsc.value;                    // 双星入河同步到 GPGPU 目标场
+  const wv=.5+.5*Math.sin(ts*.35);                    // 场混合权重
+  if(wv<.03)GPU.f1=(Math.floor(ts/16)*7)%30;          // 仅在权重≈0时换场→力场无跳变
+  if(wv>.97)GPU.f2=(Math.floor(ts/16)*13+5)%30;
+  gu.uF1.value=GPU.f1;gu.uF2.value=GPU.f2;
+  gu.uFMix.value=wv;
+  gu.tPos.value=GPU.rt.posA.texture;gu.tVel.value=GPU.rt.velA.texture;
+  renderer.setRenderTarget(GPU.rt.velB);renderer.render(GPU.velP,GPU.cam);
+  gu.tVel.value=GPU.rt.velB.texture;
+  renderer.setRenderTarget(GPU.rt.posB);renderer.render(GPU.posP,GPU.cam);
+  renderer.setRenderTarget(null);
+  let sw=GPU.rt.posA;GPU.rt.posA=GPU.rt.posB;GPU.rt.posB=sw;
+  sw=GPU.rt.velA;GPU.rt.velA=GPU.rt.velB;GPU.rt.velB=sw;
+  gu.uInit.value=0;
+  GPU.ru.tPos.value=GPU.rt.posA.texture;
+  GPU.ru.uPx.value=devicePixelRatio*innerHeight*0.85;
+  GPU.ru.uT.value=now;GPU.ru.uDrop.value=ghostU.uDrop.value;
+  GPU.ru.uGrow.value=growV;
+  GPU.ru.uBeat.value=beat;GPU.ru.uBoltG.value=bolt;
+  GPU.ru.uDevR.value=ghostU.uDevR.value;GPU.ru.uDevC.value.copy(ghostU.uDevC.value);
+  GPU.ru.uDevC2.value.copy(ghostU.uDevC2.value);GPU.ru.uBurst.value=ghostU.uBurst.value;
+  GPU.ru.uReform.value=ghostU.uReform.value;GPU.ru.uTb.value=ghostU.uTb.value;
+  GPU.ru.uMirA.value=mirA;
+ }
+
+ if(NOBLOOM)renderer.render(scene,camera);
+ else{
+  renderer.setRenderTarget(post.rtS);
+  renderer.render(scene,camera);
+  /* afterimage — 历史帧反馈残影(衰减随音乐:雷击/终章拖长) */
+  const hSrc=post.flip?post.rtH1:post.rtH2,hDst=post.flip?post.rtH2:post.rtH1;
+  post.flip=!post.flip;
+  post.uA.uDamp.value=Math.min(.5+bolt*.06+finale*.04+beat*.02,.965);
+  post.uA.tNew.value=post.rtS.texture;post.uA.tOld.value=hSrc.texture;
+  renderer.setRenderTarget(hDst);renderer.render(post.after,post.cam);
+  /* bloom — 残影后的画面进辉光 拖尾也发光 */
+  post.uB.tD.value=hDst.texture;
+  renderer.setRenderTarget(post.rtA);renderer.render(post.bright,post.cam);
+  for(let it=1;it<=2;it++){                        // 半分辨率两轮 — 锐利辉光
+   post.uBl.uRes.value.set(post.rtA.width,post.rtA.height);
+   post.uBl.tD.value=post.rtA.texture;post.uBl.uDir.value.set(it,0);
+   renderer.setRenderTarget(post.rtB);renderer.render(post.blur,post.cam);
+   post.uBl.tD.value=post.rtB.texture;post.uBl.uDir.value.set(0,it);
+   renderer.setRenderTarget(post.rtA);renderer.render(post.blur,post.cam);
+  }
+  post.uBl.uRes.value.set(post.rtC.width,post.rtC.height);  // 降采样到1/4再两轮 — 大尺度弥散
+  post.uBl.tD.value=post.rtA.texture;post.uBl.uDir.value.set(1,0);
+  renderer.setRenderTarget(post.rtC);renderer.render(post.blur,post.cam);
+  post.uBl.tD.value=post.rtC.texture;post.uBl.uDir.value.set(0,1);
+  renderer.setRenderTarget(post.rtD);renderer.render(post.blur,post.cam);
+  post.uBl.tD.value=post.rtD.texture;post.uBl.uDir.value.set(2,0);
+  renderer.setRenderTarget(post.rtC);renderer.render(post.blur,post.cam);
+  post.uBl.tD.value=post.rtC.texture;post.uBl.uDir.value.set(0,2);
+  renderer.setRenderTarget(post.rtD);renderer.render(post.blur,post.cam);
+  post.uF.tD.value=hDst.texture;post.uF.tB.value=post.rtA.texture;
+  post.uF.tB2.value=post.rtD.texture;
+  renderer.setRenderTarget(null);
+  renderer.render(post.fin,post.cam);
+ }
+}
+frame();
+</script>
+</body>
+</html>

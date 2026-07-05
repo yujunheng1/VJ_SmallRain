@@ -1,0 +1,16 @@
+html,body{margin:0;height:100%;background:#020a06;overflow:hidden;font-family:"Segoe UI",system-ui,sans-serif;}
+  canvas{position:fixed;inset:0;display:block;}
+  #overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:radial-gradient(ellipse at 50% 40%, rgba(8,32,24,.88), rgba(1,6,4,.98));
+    color:#cfe8d8;transition:opacity 1.8s ease;z-index:10;cursor:pointer;}
+  #overlay.hidden{opacity:0;pointer-events:none;}
+  #title{font-size:44px;letter-spacing:14px;font-weight:200;text-shadow:0 0 30px rgba(160,220,210,.5);}
+  #artist{font-size:15px;letter-spacing:8px;margin-top:14px;opacity:.65;}
+  #poem{font-size:12px;letter-spacing:5px;margin-top:34px;opacity:.5;line-height:2.2;text-align:center;color:#a8cfc0;}
+  #hint{font-size:12px;letter-spacing:4px;margin-top:44px;opacity:.45;animation:breathe 3s ease-in-out infinite;}
+  @keyframes breathe{0%,100%{opacity:.25}50%{opacity:.6}}
+  #err{font-size:12px;margin-top:20px;color:#e8b0a0;max-width:70%;text-align:center;display:none;}
+  #hud{position:fixed;left:18px;bottom:14px;color:rgba(190,230,205,.4);font-size:11px;letter-spacing:3px;z-index:5;
+    transition:opacity .8s;user-select:none;pointer-events:none;}
+  body.hidecursor{cursor:none;}
+  body.hidecursor #hud{opacity:0;}
